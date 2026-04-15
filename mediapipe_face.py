@@ -46,15 +46,23 @@ class _Rect:
         return self._b - self._t
 
 # MediaPipe Face Mesh indices chosen to stand in for dlib's 5-point model.
-# (0,1) left eye inner/outer corner; (2,3) right eye inner/outer corner; (4) nose tip.
-_MP_LEFT_EYE_OUTER = 33
-_MP_LEFT_EYE_INNER = 133
-_MP_RIGHT_EYE_INNER = 362
-_MP_RIGHT_EYE_OUTER = 263
+# dlib convention: shape[0:2] = subject's RIGHT eye (viewer's left),
+#                  shape[2:4] = subject's LEFT  eye (viewer's right),
+#                  shape[4]   = nose tip.
+# ROI_extraction below and the geometry in process.py assume that order,
+# so any swap rotates the aligned face upside-down and puts the "cheek"
+# rectangles on the forehead.
+# MediaPipe indices are from the canonical 468-point Face Mesh topology —
+# x is left-to-right in image coordinates, so index 33 (outer corner of
+# MediaPipe's "right eye") is the viewer's-left (subject's right) eye.
+_MP_SUBJECT_RIGHT_EYE_OUTER = 33   # viewer's left
+_MP_SUBJECT_RIGHT_EYE_INNER = 133
+_MP_SUBJECT_LEFT_EYE_INNER = 362
+_MP_SUBJECT_LEFT_EYE_OUTER = 263   # viewer's right
 _MP_NOSE_TIP = 1
 _MP_FIVE_POINT_IDXS = [
-    _MP_LEFT_EYE_OUTER, _MP_LEFT_EYE_INNER,
-    _MP_RIGHT_EYE_INNER, _MP_RIGHT_EYE_OUTER,
+    _MP_SUBJECT_RIGHT_EYE_OUTER, _MP_SUBJECT_RIGHT_EYE_INNER,
+    _MP_SUBJECT_LEFT_EYE_INNER, _MP_SUBJECT_LEFT_EYE_OUTER,
     _MP_NOSE_TIP,
 ]
 
@@ -113,7 +121,15 @@ class MediaPipeFace:
 
     def _face_alignment(self, frame, shape5):
         """Rotate+scale so the eyes sit at a canonical position in a fixed-size
-        face image. Same math as the original dlib-based aligner."""
+        face image.
+
+        The original dlib-based aligner subtracted 180 from the angle because
+        dlib's shape_to_np returns landmark y values in a convention that made
+        the rotation come out right. MediaPipe gives image-standard coords
+        directly, so the -180 is wrong here and inverts the aligned face.
+        """
+        # shape5[0:2] = viewer's-left eye (subject's right), shape5[2:4] =
+        # viewer's-right eye (subject's left). Names match dlib convention.
         left_eye_pts = shape5[0:2]
         right_eye_pts = shape5[2:4]
         left_eye_center = left_eye_pts.mean(axis=0).astype(int)
@@ -121,7 +137,7 @@ class MediaPipeFace:
 
         dY = right_eye_center[1] - left_eye_center[1]
         dX = right_eye_center[0] - left_eye_center[0]
-        angle = np.degrees(np.arctan2(dY, dX)) - 180
+        angle = np.degrees(np.arctan2(dY, dX))
 
         desired_right_eye_x = 1.0 - self.desired_left_eye[0]
         dist = np.sqrt(dX * dX + dY * dY)

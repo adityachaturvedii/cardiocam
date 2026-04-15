@@ -84,7 +84,14 @@ class Process(object):
 
 
         ROIs = self.fu.ROI_extraction(aligned_face, aligned_shape)
+        # Landmark jitter near the buffer edge can produce a degenerate
+        # (zero-area) cheek slice whose mean is NaN; skip this frame rather
+        # than poison the data buffer, which makes detrend raise.
+        if any(roi.size == 0 for roi in ROIs):
+            return False
         green_val = self.sp.extract_color(ROIs)
+        if not np.isfinite(green_val):
+            return False
 
         self.frame_out = frame
         self.frame_ROI = aligned_face
