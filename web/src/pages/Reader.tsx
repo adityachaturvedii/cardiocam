@@ -184,12 +184,17 @@ export default function Reader() {
         <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_380px] gap-6 max-w-6xl mx-auto">
           {/* Video column */}
           <div>
-            <div className="relative w-full rounded-2xl overflow-hidden bg-black shadow-lg aspect-video">
+            {/* No fixed aspect ratio — iPhone front cam returns a portrait
+                720x1280 stream, desktop webcams return landscape 1280x720.
+                Let the video element's intrinsic size drive the container
+                height; the overlay canvas is absolute-positioned on top so
+                its coordinates always match the rendered video. */}
+            <div className="relative w-full rounded-2xl overflow-hidden bg-black shadow-lg">
               <video
                 ref={camera.videoRef}
                 playsInline
                 muted
-                className="absolute inset-0 w-full h-full object-contain scale-x-[-1]"
+                className="block w-full h-auto scale-x-[-1]"
               />
               <canvas
                 ref={overlayCanvasRef}
@@ -197,7 +202,7 @@ export default function Reader() {
               />
               <canvas ref={samplingCanvasRef} className="hidden" />
               {!isRunning && (
-                <div className="absolute inset-0 flex items-center justify-center text-white/80 text-center px-6">
+                <div className="absolute inset-0 flex items-center justify-center text-white/80 text-center px-6 min-h-[12rem]">
                   {camera.state.status === 'error'
                     ? `Camera error: ${camera.state.error}`
                     : 'Camera stopped'}
