@@ -9,6 +9,9 @@ import {
   sampleCheekGreen,
 } from '../lib/roi'
 import Footer from '../components/Footer'
+import HeartIcon from '../components/HeartIcon'
+import SignalPlot from '../components/SignalPlot'
+import FFTPlot from '../components/FFTPlot'
 
 const INITIAL_HR_STATE: HeartRateState = {
   bpm: 0,
@@ -61,9 +64,6 @@ export default function Reader() {
 
       const now = performance.now()
       const result = landmarker.landmarker.detectForVideo(video, now)
-
-      // Pull the raw frame into the sampling canvas so we can read pixel
-      // data — you can't getImageData off a <video> element directly.
       samplingCtx.drawImage(video, 0, 0, vw, vh)
 
       overlayCtx.clearRect(0, 0, vw, vh)
@@ -71,28 +71,6 @@ export default function Reader() {
       if (faces && faces.length > 0) {
         setFaceDetected(true)
         const lm = faces[0]
-
-        // BBox.
-        let minX = 1,
-          maxX = 0,
-          minY = 1,
-          maxY = 0
-        for (const p of lm) {
-          if (p.x < minX) minX = p.x
-          if (p.x > maxX) maxX = p.x
-          if (p.y < minY) minY = p.y
-          if (p.y > maxY) maxY = p.y
-        }
-        overlayCtx.strokeStyle = 'rgba(244, 63, 94, 0.7)'
-        overlayCtx.lineWidth = 2
-        overlayCtx.strokeRect(
-          minX * vw,
-          minY * vh,
-          (maxX - minX) * vw,
-          (maxY - minY) * vh
-        )
-
-        // Cheek ROIs — draw on the overlay and sample from the sampling canvas.
         drawPolygon(overlayCtx, LEFT_CHEEK_RING, lm, vw, vh)
         drawPolygon(overlayCtx, RIGHT_CHEEK_RING, lm, vw, vh)
 
@@ -114,7 +92,6 @@ export default function Reader() {
         frameCount = 0
         lastFpsTick = now
       }
-
       rafRef.current = requestAnimationFrame(tick)
     }
     rafRef.current = requestAnimationFrame(tick)
@@ -149,96 +126,169 @@ export default function Reader() {
     setHr(INITIAL_HR_STATE)
   }
 
-  const bpmDisplay = hr.valid
+  // Swap camera mid-session: stop the current stream, then ask for the new
+  // one. Reset the estimator so the buffer doesn't mix signals from two
+  // different sensors.
+  const onChangeCamera = (id: string) => {
+    camera.setDeviceId(id)
+    if (camera.state.status === 'running') {
+      estimatorRef.current.reset()
+      setHr(INITIAL_HR_STATE)
+      camera.start(id)
+    }
+  }
+
+  const displayBpm = hr.valid
     ? hr.stableBpm > 0
-      ? hr.stableBpm.toFixed(0)
-      : hr.bpm.toFixed(0)
-    : '--'
+      ? hr.stableBpm
+      : hr.bpm
+    : 0
+  const bpmText = hr.valid ? displayBpm.toFixed(0) : '--'
   const acquiring = camera.state.status === 'running' && !hr.valid
 
+  const statusLine = (() => {
+    if (landmarker.status === 'loading') return 'Loading face model…'
+    if (landmarker.status === 'error')
+      return `Model error: ${landmarker.error}`
+    if (camera.state.status === 'error')
+      return `Camera error: ${camera.state.error}`
+    if (camera.state.status !== 'running') return 'Ready — press Start'
+    if (!faceDetected) return 'Looking for your face…'
+    if (acquiring)
+      return `Acquiring · SNR ${hr.snr.toFixed(1)} · buffer ${(hr.warmup * 100).toFixed(0)}%`
+    return `Instantaneous ${hr.bpm.toFixed(1)} · SNR ${hr.snr.toFixed(1)} · ${hr.fps.toFixed(1)} fps`
+  })()
+
+  const isRunning = camera.state.status === 'running'
+
   return (
-    <div className="min-h-full flex flex-col px-4 py-6 md:px-10 md:py-10">
-      <header className="flex items-center justify-between mb-6">
-        <Link to="/" className="text-ink2 hover:text-ink text-sm">
-          ← back
+    <div className="min-h-full flex flex-col">
+      <header className="flex items-center justify-between px-4 md:px-8 py-4 border-b border-ink/5">
+        <Link
+          to="/"
+          className="inline-flex items-center gap-2 text-ink2 hover:text-ink text-sm"
+        >
+          ← <span className="hidden sm:inline">back</span>
         </Link>
-        <div className="text-sm text-ink2 tabular-nums">
-          FPS {fps.toFixed(1)}
+        <div className="inline-flex items-center gap-2 text-heart font-medium">
+          <HeartIcon bpm={hr.valid ? displayBpm : 0} size={18} />
+          cardiocam
+        </div>
+        <div className="text-xs text-ink2 tabular-nums">
+          {fps.toFixed(0)} fps
         </div>
       </header>
 
-      <section className="flex-1 flex flex-col items-center">
-        <div className="relative w-full max-w-3xl rounded-2xl overflow-hidden bg-black shadow">
-          <video
-            ref={camera.videoRef}
-            playsInline
-            muted
-            className="block w-full h-auto object-contain scale-x-[-1]"
-          />
-          <canvas
-            ref={overlayCanvasRef}
-            className="absolute inset-0 w-full h-full scale-x-[-1] pointer-events-none"
-          />
-          <canvas ref={samplingCanvasRef} className="hidden" />
-          {camera.state.status !== 'running' && (
-            <div className="absolute inset-0 flex items-center justify-center text-white/80">
-              {camera.state.status === 'error'
-                ? `Camera error: ${camera.state.error}`
-                : 'Camera stopped'}
+      <main className="flex-1 px-4 md:px-8 py-6 md:py-8">
+        {/* On mobile: stacked. On desktop: video on left, metrics+plots on right. */}
+        <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_380px] gap-6 max-w-6xl mx-auto">
+          {/* Video column */}
+          <div>
+            <div className="relative w-full rounded-2xl overflow-hidden bg-black shadow-lg aspect-[4/3] md:aspect-video">
+              <video
+                ref={camera.videoRef}
+                playsInline
+                muted
+                className="absolute inset-0 w-full h-full object-contain scale-x-[-1]"
+              />
+              <canvas
+                ref={overlayCanvasRef}
+                className="absolute inset-0 w-full h-full scale-x-[-1] pointer-events-none"
+              />
+              <canvas ref={samplingCanvasRef} className="hidden" />
+              {!isRunning && (
+                <div className="absolute inset-0 flex items-center justify-center text-white/80 text-center px-6">
+                  {camera.state.status === 'error'
+                    ? `Camera error: ${camera.state.error}`
+                    : 'Camera stopped'}
+                </div>
+              )}
+              {acquiring && faceDetected && (
+                <div className="absolute top-3 left-3 rounded-full bg-black/60 text-white text-xs px-3 py-1 backdrop-blur">
+                  Acquiring · sit still
+                </div>
+              )}
             </div>
-          )}
-        </div>
 
-        <div className="mt-8 flex flex-col items-center gap-2">
-          <div
-            className={`text-7xl font-semibold tabular-nums ${
-              hr.valid ? 'text-heart' : 'text-ink2/50'
-            }`}
-          >
-            {bpmDisplay}
-            <span className="text-2xl text-ink2 font-normal ml-2">BPM</span>
-          </div>
-          <div className="text-sm text-ink2 tabular-nums">
-            {landmarker.status === 'loading' && 'Loading face model…'}
-            {landmarker.status === 'error' && `Model error: ${landmarker.error}`}
-            {landmarker.status === 'ready' &&
-              camera.state.status !== 'running' &&
-              'Ready — press Start'}
-            {landmarker.status === 'ready' &&
-              camera.state.status === 'running' &&
-              !faceDetected &&
-              'Looking for your face…'}
-            {acquiring &&
-              faceDetected &&
-              `Acquiring signal · SNR ${hr.snr.toFixed(1)} · buffer ${(
-                hr.warmup * 100
-              ).toFixed(0)}%`}
-            {hr.valid &&
-              `Instantaneous ${hr.bpm.toFixed(1)} BPM · SNR ${hr.snr.toFixed(
-                1
-              )} · ${hr.fps.toFixed(1)} fps`}
-          </div>
-        </div>
+            {/* Controls */}
+            <div className="mt-4 flex flex-wrap items-center gap-3">
+              {isRunning ? (
+                <button
+                  onClick={onStop}
+                  className="rounded-full bg-ink px-6 py-2 text-white font-medium text-sm hover:bg-ink/85 transition"
+                >
+                  Stop
+                </button>
+              ) : (
+                <button
+                  onClick={onStart}
+                  disabled={landmarker.status !== 'ready'}
+                  className="rounded-full bg-heart px-6 py-2 text-white font-medium text-sm hover:bg-heart2 transition disabled:opacity-50"
+                >
+                  {landmarker.status === 'ready' ? 'Start' : 'Preparing…'}
+                </button>
+              )}
 
-        <div className="mt-8">
-          {camera.state.status === 'running' ? (
-            <button
-              onClick={onStop}
-              className="rounded-full bg-ink px-8 py-3 text-white font-medium"
-            >
-              Stop
-            </button>
-          ) : (
-            <button
-              onClick={onStart}
-              disabled={landmarker.status !== 'ready'}
-              className="rounded-full bg-heart px-8 py-3 text-white font-medium disabled:opacity-50"
-            >
-              {landmarker.status === 'ready' ? 'Start' : 'Preparing…'}
-            </button>
-          )}
+              {camera.devices.length > 1 && camera.deviceId && (
+                <select
+                  value={camera.deviceId}
+                  onChange={(e) => onChangeCamera(e.target.value)}
+                  className="rounded-full border border-ink/15 bg-white px-4 py-2 text-sm text-ink hover:border-ink/30 transition"
+                >
+                  {camera.devices.map((d) => (
+                    <option key={d.deviceId} value={d.deviceId}>
+                      {d.label || `Camera ${d.deviceId.slice(0, 6)}`}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </div>
+          </div>
+
+          {/* Metrics + plots column */}
+          <aside className="flex flex-col gap-6">
+            {/* BPM card */}
+            <div className="rounded-2xl bg-white shadow-sm border border-ink/5 p-6 md:p-8 text-center">
+              <div
+                className={`inline-flex items-baseline gap-3 ${hr.valid ? 'text-heart' : 'text-ink2/40'}`}
+              >
+                <HeartIcon
+                  bpm={hr.valid ? displayBpm : 0}
+                  size={32}
+                  className="self-center"
+                />
+                <div className="text-7xl md:text-8xl font-semibold tabular-nums leading-none">
+                  {bpmText}
+                </div>
+              </div>
+              <div className="mt-2 text-sm text-ink2 uppercase tracking-wider">
+                beats per minute
+              </div>
+              <div className="mt-4 text-xs text-ink2 tabular-nums min-h-[1em]">
+                {statusLine}
+              </div>
+            </div>
+
+            {/* Plots */}
+            <div className="rounded-2xl bg-white shadow-sm border border-ink/5 p-5">
+              <div className="text-xs font-medium text-ink2 uppercase tracking-wider mb-2">
+                Pulse signal
+              </div>
+              <SignalPlot signal={hr.signal} />
+            </div>
+            <div className="rounded-2xl bg-white shadow-sm border border-ink/5 p-5">
+              <div className="text-xs font-medium text-ink2 uppercase tracking-wider mb-2">
+                Spectrum
+              </div>
+              <FFTPlot
+                fft={hr.fft}
+                freqsBpm={hr.freqsBpm}
+                peakBpm={hr.valid ? hr.bpm : 0}
+              />
+            </div>
+          </aside>
         </div>
-      </section>
+      </main>
       <Footer />
     </div>
   )
@@ -260,9 +310,9 @@ function drawPolygon(
     else ctx.lineTo(x, y)
   }
   ctx.closePath()
-  ctx.fillStyle = 'rgba(20, 184, 166, 0.25)'
+  ctx.fillStyle = 'rgba(20, 184, 166, 0.22)'
   ctx.fill()
-  ctx.strokeStyle = 'rgba(20, 184, 166, 1)'
+  ctx.strokeStyle = 'rgba(20, 184, 166, 0.95)'
   ctx.lineWidth = 2
   ctx.stroke()
 }
