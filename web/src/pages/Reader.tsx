@@ -179,12 +179,12 @@ export default function Reader() {
         </div>
       </header>
 
-      <main className="flex-1 px-4 md:px-8 py-6 md:py-8">
+      <main className="flex-1 px-4 md:px-8 py-4 md:py-8">
         {/* On mobile: stacked. On desktop: video on left, metrics+plots on right. */}
         <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_380px] gap-6 max-w-6xl mx-auto">
           {/* Video column */}
           <div>
-            <div className="relative w-full rounded-2xl overflow-hidden bg-black shadow-lg aspect-[4/3] md:aspect-video">
+            <div className="relative w-full rounded-2xl overflow-hidden bg-black shadow-lg aspect-video">
               <video
                 ref={camera.videoRef}
                 playsInline
