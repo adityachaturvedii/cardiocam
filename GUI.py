@@ -108,8 +108,14 @@ class GUI(QMainWindow, QThread):
         self.timer = pg.QtCore.QTimer()
         self.timer.timeout.connect(self.update)
         self.timer.start(200)
-        
-        
+
+        # Frame-processing timer. Fires main_loop roughly at webcam rate when
+        # Start is pressed. Using a QTimer instead of a while-loop keeps the
+        # Qt event loop responsive (clicks, repaints, close button) and avoids
+        # burning 100% CPU on spin.
+        self.frame_timer = pg.QtCore.QTimer()
+        self.frame_timer.timeout.connect(self.main_loop)
+
         self.statusBar = QStatusBar()
         self.statusBar.setFont(font)
         self.setStatusBar(self.statusBar)
@@ -254,11 +260,13 @@ class GUI(QMainWindow, QThread):
             self.cbbInput.setEnabled(False)
             self.btnOpen.setEnabled(False)
             self.lblHR2.clear()
-            while self.status == True:
-                self.main_loop()
+            # ~30 FPS; the real pacing is set by webcam capture inside main_loop.
+            # A small non-zero interval lets Qt dispatch UI events between frames.
+            self.frame_timer.start(33)
 
         elif self.status == True:
             self.status = False
+            self.frame_timer.stop()
             input.stop()
             self.btnStart.setText("Start")
             self.cbbInput.setEnabled(True)
