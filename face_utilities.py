@@ -60,6 +60,10 @@ class Face_utilities():
         self._detect_interval = 3
         self._frames_since_detect = 0
 
+        # Downscale for detection only — HOG is O(pixels). Landmarks still run
+        # at full resolution so ROI geometry is unaffected.
+        self._detect_width = 320
+
         #FACIAL_LANDMARKS_IDXS = FACIAL_LANDMARKS_68_IDXS
     
     def face_alignment(self, frame, shape):
@@ -240,10 +244,26 @@ class Face_utilities():
         if (self.last_rects is None
                 or len(self.last_rects) == 0
                 or self._frames_since_detect >= self._detect_interval):
-            rects = self.face_detection(frame, gray=gray)
-            if rects is None or len(rects) == 0:
-                self.last_rects = None
-                return None, None
+            h, w = gray.shape[:2]
+            if w > self._detect_width:
+                scale = self._detect_width / float(w)
+                small_gray = cv2.resize(gray, (self._detect_width, int(h * scale)),
+                                         interpolation=cv2.INTER_LINEAR)
+                small_rects = self.face_detection(small_gray, gray=small_gray)
+                if small_rects is None or len(small_rects) == 0:
+                    self.last_rects = None
+                    return None, None
+                inv = 1.0 / scale
+                rects = dlib.rectangles()
+                for r in small_rects:
+                    rects.append(dlib.rectangle(
+                        int(r.left() * inv), int(r.top() * inv),
+                        int(r.right() * inv), int(r.bottom() * inv)))
+            else:
+                rects = self.face_detection(frame, gray=gray)
+                if rects is None or len(rects) == 0:
+                    self.last_rects = None
+                    return None, None
             self.last_rects = rects
             self._frames_since_detect = 0
         else:
