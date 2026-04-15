@@ -53,7 +53,13 @@ class Face_utilities():
         self.last_rects = None
         self.last_shape = None
         self.last_aligned_shape = None
-        
+
+        # Skip-detection cache: rerun HOG every N frames, reuse rect in between.
+        # Landmark predictor still runs every frame so the 5-point shape tracks
+        # small head motion.
+        self._detect_interval = 3
+        self._frames_since_detect = 0
+
         #FACIAL_LANDMARKS_IDXS = FACIAL_LANDMARKS_68_IDXS
     
     def face_alignment(self, frame, shape):
@@ -230,10 +236,19 @@ class Face_utilities():
         #face = imutils.resize(face, width=200)
         # face must be gray
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        rects = self.face_detection(frame, gray=gray)
 
-        if len(rects)<0 or len(rects)==0:
-            return None, None
+        if (self.last_rects is None
+                or len(self.last_rects) == 0
+                or self._frames_since_detect >= self._detect_interval):
+            rects = self.face_detection(frame, gray=gray)
+            if rects is None or len(rects) == 0:
+                self.last_rects = None
+                return None, None
+            self.last_rects = rects
+            self._frames_since_detect = 0
+        else:
+            rects = self.last_rects
+            self._frames_since_detect += 1
 
         shape = self.predictor(gray, rects[0])
         shape = face_utils.shape_to_np(shape)
