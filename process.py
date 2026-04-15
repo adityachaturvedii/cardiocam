@@ -1,12 +1,9 @@
 import cv2
 import numpy as np
 import time
-from face_detection import FaceDetection
 from scipy import signal
-from face_utilities import Face_utilities
+from mediapipe_face import MediaPipeFace
 from signal_processing import Signal_processing
-from imutils import face_utils
-# from sklearn.decomposition import FastICA
 
 class Process(object):
     def __init__(self):
@@ -22,10 +19,9 @@ class Process(object):
         self.freqs = []
         self.t0 = time.time()
         self.bpm = 0
-        self.fd = FaceDetection()
         self.bpms = []
         self.peaks = []
-        self.fu = Face_utilities()
+        self.fu = MediaPipeFace()
         self.sp = Signal_processing()
 
         self._hamming = np.hamming(self.buffer_size)
@@ -67,7 +63,8 @@ class Process(object):
             return False
         rects, face, shape, aligned_face, aligned_shape = ret_process
 
-        (x, y, w, h) = face_utils.rect_to_bb(rects[0])
+        r = rects[0]
+        x, y, w, h = r.left(), r.top(), r.width(), r.height()
         cv2.rectangle(frame,(x,y),(x+w,y+h),(255,0,0),2)
         
         if(len(aligned_shape)==68):
