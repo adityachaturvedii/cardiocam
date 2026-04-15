@@ -37,6 +37,17 @@ class Process(object):
         self._bp_b = None
         self._bp_a = None
 
+        # Signal-quality gate. The FFT argmax in a noise-only buffer is still
+        # "a peak" — without an SNR check the displayed BPM is a random number
+        # in [50, 180]. Require the peak to stand clearly above the in-band
+        # median before trusting it, and discard the first few readings after
+        # the buffer first fills (the tail of signal warm-up).
+        self._snr_threshold = 4.0
+        self._bpm_valid = False
+        self.bpm_snr = 0.0
+        self._warmup_frames = 10
+        self._frames_since_full = 0
+
         #self.red = np.zeros((256,256,3),np.uint8)
         
     def extractColor(self, frame):
@@ -130,18 +141,30 @@ class Process(object):
             
             self.fft = np.abs(raw)**2#get amplitude spectrum
         
-            idx = np.where((freqs > 50) & (freqs < 180))#the range of frequency that HR is supposed to be within 
+            idx = np.where((freqs > 50) & (freqs < 180))#the range of frequency that HR is supposed to be within
             pruned = self.fft[idx]
             pfreq = freqs[idx]
-            
-            self.freqs = pfreq 
+
+            self.freqs = pfreq
             self.fft = pruned
-            
+
             idx2 = np.argmax(pruned)#max in the range can be HR
-            
+
+            # SNR = peak / median-in-band. Median is robust to a second peak
+            # (e.g. harmonic). A clean cardiac signal typically scores >5;
+            # pure noise sits around 1-2.
+            peak_val = pruned[idx2]
+            band_median = np.median(pruned)
+            self.bpm_snr = float(peak_val / band_median) if band_median > 0 else 0.0
+
+            self._frames_since_full += 1
+            warm = self._frames_since_full >= self._warmup_frames
+            self._bpm_valid = warm and (self.bpm_snr >= self._snr_threshold)
+
             self.bpm = self.freqs[idx2]
-            self.bpms.append(self.bpm)
-            
+            if self._bpm_valid:
+                self.bpms.append(self.bpm)
+
             processed = self.butter_bandpass_filter(processed,0.8,3,self.fps,order = 3)
             #ifft = np.fft.irfft(raw)
         self.samples = processed # multiply the signal with 5 for easier to see in the plot
@@ -178,6 +201,9 @@ class Process(object):
         self._last_fps_for_bp = None
         self._bp_b = None
         self._bp_a = None
+        self._bpm_valid = False
+        self.bpm_snr = 0.0
+        self._frames_since_full = 0
         
     def butter_bandpass(self, lowcut, highcut, fs, order=5):
         nyq = 0.5 * fs

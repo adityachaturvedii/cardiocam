@@ -261,11 +261,15 @@ class GUI(QMainWindow, QThread):
                        self.f_fr.strides[0], QImage.Format_RGB888)
         self.lblROI.setPixmap(QPixmap.fromImage(f_img))
         
-        self.lblHR.setText("Freq: " + str(float("{:.2f}".format(self.bpm))))
-        
-        if self.process.bpms.__len__() >50:
-            if(max(self.process.bpms-np.mean(self.process.bpms))<5): #show HR if it is stable -the change is not over 5 bpm- for 3s
-                self.lblHR2.setText("Heart rate: " + str(float("{:.2f}".format(np.mean(self.process.bpms)))) + " bpm")
+        if self.process._bpm_valid:
+            self.lblHR.setText("Freq: {:.2f}  (SNR {:.1f})".format(self.bpm, self.process.bpm_snr))
+        else:
+            self.lblHR.setText("Freq: --  (acquiring, SNR {:.1f})".format(self.process.bpm_snr))
+
+        if len(self.process.bpms) > 50:
+            bpms_arr = np.asarray(self.process.bpms)
+            if (bpms_arr.max() - bpms_arr.mean()) < 5:
+                self.lblHR2.setText("Heart rate: {:.2f} bpm".format(bpms_arr.mean()))
 
         #self.make_bpm_plot()#need to open a cv2.imshow() window to handle a pause 
         #QtTest.QTest.qWait(10)#wait for the GUI to respond
