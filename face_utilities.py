@@ -150,27 +150,28 @@ class Face_utilities():
         # return aligned_face, aligned_shape
         return aligned_face,aligned_shape
     
-    def face_detection(self, frame):
+    def face_detection(self, frame, gray=None):
         '''
         Detect faces in a frame
-        
+
         Args:
             frame (cv2 image): a normal frame grab from camera or video
-            
+            gray (cv2 image, optional): pre-computed grayscale of frame. Avoids a redundant BGR2GRAY.
+
         Outputs:
             rects (array): detected faces as rectangles
         '''
         if self.detector is None:
             self.detector = dlib.get_frontal_face_detector()
-        
+
         if frame is None:
             return
-            
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        #get all faces in the frame
+
+        if gray is None:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         rects = self.detector(gray, 0)
         # to get the coords from a rect, use: (x, y, w, h) = face_utils.rect_to_bb(rects[0])
-        
+
         return rects
     
     def age_gender_detection(self, face):
@@ -229,11 +230,11 @@ class Face_utilities():
         #face = imutils.resize(face, width=200)
         # face must be gray
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        rects = self.face_detection(frame)
-        
+        rects = self.face_detection(frame, gray=gray)
+
         if len(rects)<0 or len(rects)==0:
             return None, None
-            
+
         shape = self.predictor(gray, rects[0])
         shape = face_utils.shape_to_np(shape)
         
