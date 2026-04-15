@@ -14,3 +14,10 @@ body {
   @apply bg-canvas text-ink font-sans antialiased;
   margin: 0;
 }
+
+@keyframes heart-pulse {
+  0%, 100% { transform: scale(1); }
+  15% { transform: scale(1.22); }
+  30% { transform: scale(1); }
+  45% { transform: scale(1.08); }
+}
