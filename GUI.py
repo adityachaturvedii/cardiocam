@@ -70,10 +70,14 @@ class GUI(QMainWindow, QThread):
         # Camera-device selector. Populated at startup from list_cameras().
         # macOS commonly exposes both FaceTime HD and an iPhone Continuity
         # Camera; picking index 0 blindly lands on the wrong one.
+        self.lblCamera = QLabel("Camera:", self)
+        self.lblCamera.setGeometry(660, 625, 90, 40)
+        self.lblCamera.setFont(font)
+
         self.cbbCamera = QComboBox(self)
-        self.cbbCamera.setFixedWidth(280)
-        self.cbbCamera.setFixedHeight(50)
-        self.cbbCamera.move(660, 520)
+        self.cbbCamera.setFixedWidth(300)
+        self.cbbCamera.setFixedHeight(40)
+        self.cbbCamera.move(760, 630)
         self.cbbCamera.setFont(font)
         cams = list_cameras()
         if cams:
@@ -141,7 +145,7 @@ class GUI(QMainWindow, QThread):
         self.setStatusBar(self.statusBar)
 
         #config main window
-        self.setGeometry(100,100,1160,640)
+        self.setGeometry(100,100,1160,700)
         #self.center()
         self.setWindowTitle("Heart rate monitor")
         self.show()
