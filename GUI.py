@@ -10,16 +10,20 @@ import pyqtgraph as pg
 import sys
 import time
 from process import Process
-from webcam import Webcam
+from webcam import Webcam, list_cameras
 from video import Video
 from interface import waitKey, plotXY
 
 class GUI(QMainWindow, QThread):
     def __init__(self):
         super(GUI,self).__init__()
-        self.initUI()
         self.webcam = Webcam()
         self.video = Video()
+        self.initUI()
+        # Apply whichever camera the dropdown landed on at startup
+        initial_cam = self.cbbCamera.currentData()
+        if initial_cam is not None and initial_cam >= 0:
+            self.webcam.set_index(initial_cam)
         self.input = self.webcam
         self.dirname = ""
         print("Input: webcam")
@@ -62,6 +66,22 @@ class GUI(QMainWindow, QThread):
         self.cbbInput.move(20,520)
         self.cbbInput.setFont(font)
         self.cbbInput.activated.connect(self.selectInput)
+
+        # Camera-device selector. Populated at startup from list_cameras().
+        # macOS commonly exposes both FaceTime HD and an iPhone Continuity
+        # Camera; picking index 0 blindly lands on the wrong one.
+        self.cbbCamera = QComboBox(self)
+        self.cbbCamera.setFixedWidth(280)
+        self.cbbCamera.setFixedHeight(50)
+        self.cbbCamera.move(660, 520)
+        self.cbbCamera.setFont(font)
+        cams = list_cameras()
+        if cams:
+            for idx, (w, h) in cams:
+                self.cbbCamera.addItem("Camera {} ({}x{})".format(idx, w, h), idx)
+        else:
+            self.cbbCamera.addItem("No camera found", -1)
+        self.cbbCamera.activated.connect(self.selectCamera)
         #-------------------
         
         self.lblDisplay = QLabel(self) #label to show frame from camera
@@ -164,7 +184,14 @@ class GUI(QMainWindow, QThread):
             self.input = self.video
             print("Input: video")
             self.btnOpen.setEnabled(True)
-            #self.statusBar.showMessage("Input: video",5000)   
+            #self.statusBar.showMessage("Input: video",5000)
+
+    def selectCamera(self):
+        idx = self.cbbCamera.currentData()
+        if idx is None or idx < 0:
+            return
+        self.webcam.set_index(idx)
+        print("Camera index:", idx)
     
     # def make_bpm_plot(self):
         # plotXY([[self.process.times[20:],
