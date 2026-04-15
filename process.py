@@ -25,7 +25,14 @@ class Process(object):
         self.sp = Signal_processing()
 
         self._hamming = np.hamming(self.buffer_size)
-        self._freq_axis = np.arange(self.buffer_size // 2 + 1)
+        # Zero-pad the FFT for finer frequency resolution. With buffer_size=100
+        # and fps~30, native bin width is ~18 BPM — coarse enough that argmax
+        # can miss the true HR by a bin (e.g. read 63 when truth is 75). Zero
+        # padding to 1024 points interpolates the spectrum so argmax lands on
+        # a ~3.5 BPM grid. No accuracy compromise: we're not inventing signal,
+        # just reading the existing DFT on a denser grid.
+        self._n_fft = 1024
+        self._freq_axis = np.arange(self._n_fft // 2 + 1)
         self._bp_low = 0.8
         self._bp_high = 3.0
         self._bp_order = 3
@@ -127,7 +134,10 @@ class Process(object):
         # start calculating after the first 10 frames
         if L == self.buffer_size:
             
-            self.fps = float(L) / (self.times[-1] - self.times[0])#calculate HR using a true fps of processor of the computer, not the fps the camera provide
+            # N samples span N-1 sample intervals, so the true sample rate
+            # is (L-1)/duration, not L/duration. Previous off-by-one inflated
+            # fps by ~1% and shifted every computed BPM by the same factor.
+            self.fps = float(L - 1) / (self.times[-1] - self.times[0])
             even_times = np.linspace(self.times[0], self.times[-1], L)
 
             processed = signal.detrend(processed)#detrend the signal to avoid interference of light change
@@ -135,9 +145,10 @@ class Process(object):
             interpolated = self._hamming * interpolated#make the signal become more periodic (advoid spectral leakage)
             #norm = (interpolated - np.mean(interpolated))/np.std(interpolated)#normalization
             norm = interpolated/np.linalg.norm(interpolated)
-            raw = np.fft.rfft(norm*30)#do real fft with the normalization multiplied by 10
+            # Zero-pad to self._n_fft for finer spectral resolution.
+            raw = np.fft.rfft(norm * 30, n=self._n_fft)
 
-            self.freqs = float(self.fps) / L * self._freq_axis
+            self.freqs = float(self.fps) / self._n_fft * self._freq_axis
             freqs = 60. * self.freqs
             
             # idx_remove = np.where((freqs < 50) & (freqs > 180))
