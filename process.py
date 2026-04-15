@@ -15,7 +15,7 @@ class Process(object):
         self.frame_out = np.zeros((10, 10, 3), np.uint8)
         self.samples = []
         self.buffer_size = 100
-        self.times = [] 
+        self.times = []
         self.data_buffer = []
         self.fps = 0
         self.fft = []
@@ -27,6 +27,15 @@ class Process(object):
         self.peaks = []
         self.fu = Face_utilities()
         self.sp = Signal_processing()
+
+        self._hamming = np.hamming(self.buffer_size)
+        self._freq_axis = np.arange(self.buffer_size // 2 + 1)
+        self._bp_low = 0.8
+        self._bp_high = 3.0
+        self._bp_order = 3
+        self._last_fps_for_bp = None
+        self._bp_b = None
+        self._bp_a = None
 
         #self.red = np.zeros((256,256,3),np.uint8)
         
@@ -105,15 +114,15 @@ class Process(object):
             
             self.fps = float(L) / (self.times[-1] - self.times[0])#calculate HR using a true fps of processor of the computer, not the fps the camera provide
             even_times = np.linspace(self.times[0], self.times[-1], L)
-            
+
             processed = signal.detrend(processed)#detrend the signal to avoid interference of light change
             interpolated = np.interp(even_times, self.times, processed) #interpolation by 1
-            interpolated = np.hamming(L) * interpolated#make the signal become more periodic (advoid spectral leakage)
+            interpolated = self._hamming * interpolated#make the signal become more periodic (advoid spectral leakage)
             #norm = (interpolated - np.mean(interpolated))/np.std(interpolated)#normalization
             norm = interpolated/np.linalg.norm(interpolated)
             raw = np.fft.rfft(norm*30)#do real fft with the normalization multiplied by 10
-            
-            self.freqs = float(self.fps) / L * np.arange(L / 2 + 1)
+
+            self.freqs = float(self.fps) / L * self._freq_axis
             freqs = 60. * self.freqs
             
             # idx_remove = np.where((freqs < 50) & (freqs > 180))
@@ -158,7 +167,7 @@ class Process(object):
         self.frame_ROI = np.zeros((10, 10, 3), np.uint8)
         self.frame_out = np.zeros((10, 10, 3), np.uint8)
         self.samples = []
-        self.times = [] 
+        self.times = []
         self.data_buffer = []
         self.fps = 0
         self.fft = []
@@ -166,6 +175,9 @@ class Process(object):
         self.t0 = time.time()
         self.bpm = 0
         self.bpms = []
+        self._last_fps_for_bp = None
+        self._bp_b = None
+        self._bp_a = None
         
     def butter_bandpass(self, lowcut, highcut, fs, order=5):
         nyq = 0.5 * fs
@@ -176,9 +188,18 @@ class Process(object):
 
 
     def butter_bandpass_filter(self, data, lowcut, highcut, fs, order=5):
-        b, a = self.butter_bandpass(lowcut, highcut, fs, order=order)
-        y = signal.lfilter(b, a, data)
-        return y 
+        if (self._bp_b is None
+                or self._last_fps_for_bp is None
+                or abs(fs - self._last_fps_for_bp) > 0.5
+                or lowcut != self._bp_low
+                or highcut != self._bp_high
+                or order != self._bp_order):
+            self._bp_b, self._bp_a = self.butter_bandpass(lowcut, highcut, fs, order=order)
+            self._last_fps_for_bp = fs
+            self._bp_low = lowcut
+            self._bp_high = highcut
+            self._bp_order = order
+        return signal.lfilter(self._bp_b, self._bp_a, data)
     
 
         
