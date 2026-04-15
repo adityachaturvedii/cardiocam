@@ -233,6 +233,21 @@ class GUI(QMainWindow, QThread):
         self.lblDisplay.clear()
         self.lblDisplay.setStyleSheet("background-color: #000000")
 
+    @staticmethod
+    def _fit_for_display(frame, target_w, target_h):
+        """Scale frame to fit target dims while preserving aspect ratio, then
+        pad with black. Keeps the whole captured view visible in the label
+        instead of cropping to the top-left corner."""
+        h, w = frame.shape[:2]
+        scale = min(target_w / float(w), target_h / float(h))
+        new_w, new_h = int(round(w * scale)), int(round(h * scale))
+        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        canvas = np.zeros((target_h, target_w, 3), dtype=resized.dtype)
+        off_x = (target_w - new_w) // 2
+        off_y = (target_h - new_h) // 2
+        canvas[off_y:off_y + new_h, off_x:off_x + new_w] = resized
+        return canvas
+
     def main_loop(self):
         frame = self.input.get_frame()
 
@@ -252,10 +267,14 @@ class GUI(QMainWindow, QThread):
             self.bpm = 0
         
         self.frame = cv2.cvtColor(self.frame, cv2.COLOR_RGB2BGR)
-        cv2.putText(self.frame, "FPS "+str(float("{:.2f}".format(self.process.fps))),
+        # Fit the frame into the 640x480 label. Qt's setPixmap doesn't scale;
+        # at native 1920x1080 it would crop to the top-left quadrant and hide
+        # the subject (the ceiling is above the user's face).
+        disp = self._fit_for_display(self.frame, 640, 480)
+        cv2.putText(disp, "FPS "+str(float("{:.2f}".format(self.process.fps))),
                        (20,460), cv2.FONT_HERSHEY_PLAIN, 1.5, (0, 255, 255),2)
-        img = QImage(self.frame, self.frame.shape[1], self.frame.shape[0], 
-                        self.frame.strides[0], QImage.Format_RGB888)
+        img = QImage(disp.data, disp.shape[1], disp.shape[0],
+                        disp.strides[0], QImage.Format_RGB888)
         self.lblDisplay.setPixmap(QPixmap.fromImage(img))
         
         self.f_fr = cv2.cvtColor(self.f_fr, cv2.COLOR_RGB2BGR)
