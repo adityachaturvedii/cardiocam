@@ -99,12 +99,33 @@ class MediaPipeFace:
         self.desired_face_height = face_width
 
     def _landmarks_to_five_point(self, norm_landmarks, w, h):
-        """Extract the 5 representative points (shape==dlib 5-point) in pixels."""
+        """Project Face Mesh to a 5-point shape matching dlib's convention:
+        (0,1) image-left eye pair, (2,3) image-right eye pair, (4) nose tip.
+
+        The webcam layer horizontal-flips frames, and MediaPipe's *labeled*
+        eye indices are anatomical (subject-relative). Using labels blindly
+        lets the flip invert which eye lands on which image side and breaks
+        downstream ROI math. Pick the pair by image x instead.
+        """
         pts = np.empty((5, 2), dtype=np.int32)
         for out_i, mp_i in enumerate(_MP_FIVE_POINT_IDXS):
             lm = norm_landmarks[mp_i]
             pts[out_i, 0] = int(round(lm.x * w))
             pts[out_i, 1] = int(round(lm.y * h))
+
+        # If the "labeled-right-eye" pair is actually image-left (mean x
+        # smaller), swap the two pairs so (0,1) is always the image-left
+        # eye pair and (2,3) the image-right — independent of any flip.
+        if pts[0:2, 0].mean() > pts[2:4, 0].mean():
+            pts[[0, 1, 2, 3]] = pts[[2, 3, 0, 1]]
+
+        # ROI_extraction uses shape[1][0]:shape[0][0] (needs pts[1].x <
+        # pts[0].x) and shape[2][0]:shape[3][0] (needs pts[2].x < pts[3].x)
+        # to slice non-empty cheek rectangles. Enforce both orderings.
+        if pts[0, 0] < pts[1, 0]:
+            pts[[0, 1]] = pts[[1, 0]]
+        if pts[2, 0] > pts[3, 0]:
+            pts[[2, 3]] = pts[[3, 2]]
         return pts
 
     def _face_rect_from_landmarks(self, norm_landmarks, w, h):
@@ -123,17 +144,23 @@ class MediaPipeFace:
         """Rotate+scale so the eyes sit at a canonical position in a fixed-size
         face image.
 
-        The original dlib-based aligner subtracted 180 from the angle because
-        dlib's shape_to_np returns landmark y values in a convention that made
-        the rotation come out right. MediaPipe gives image-standard coords
-        directly, so the -180 is wrong here and inverts the aligned face.
+        We don't trust the landmark *ordering* for alignment because the
+        webcam layer horizontal-flips the frame (Webcam.get_frame calls
+        cv2.flip). After that flip the anatomical "right eye" sits on image-
+        right, which is the opposite of a non-flipped capture. Trusting the
+        declared order would rotate the face 180° and push it out of the
+        warpAffine canvas (aligned_face comes out all-zero).
+
+        Instead pick the two eye centers by image x: leftmost = left_in_image,
+        rightmost = right_in_image. That makes dX always positive and the
+        eye line nearly horizontal for an upright face — no -180 shim needed.
         """
-        # shape5[0:2] = viewer's-left eye (subject's right), shape5[2:4] =
-        # viewer's-right eye (subject's left). Names match dlib convention.
-        left_eye_pts = shape5[0:2]
-        right_eye_pts = shape5[2:4]
-        left_eye_center = left_eye_pts.mean(axis=0).astype(int)
-        right_eye_center = right_eye_pts.mean(axis=0).astype(int)
+        center_a = shape5[0:2].mean(axis=0).astype(int)
+        center_b = shape5[2:4].mean(axis=0).astype(int)
+        if center_a[0] <= center_b[0]:
+            left_eye_center, right_eye_center = center_a, center_b
+        else:
+            left_eye_center, right_eye_center = center_b, center_a
 
         dY = right_eye_center[1] - left_eye_center[1]
         dX = right_eye_center[0] - left_eye_center[0]
