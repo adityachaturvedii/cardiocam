@@ -1,4 +1,13 @@
-import { estimateBpm } from './signalProcessing'
+import { chromTransform, estimateBpm, posTransform } from './signalProcessing'
+
+export type BvpMethod =
+  | 'GREEN'
+  | 'POS'
+  | 'CHROM'
+  | 'POS+CHROM'
+  | 'POS+GREEN'
+  | 'CHROM+GREEN'
+  | 'POS+CHROM+GREEN'
 
 export interface HeartRateState {
   /** Valid instantaneous BPM (FFT peak in band). 0 until the SNR gate opens. */
@@ -11,7 +20,7 @@ export interface HeartRateState {
   fps: number
   /** 0-1 progress while the initial 100-sample buffer is filling. */
   warmup: number
-  /** Most recent detrended signal waveform, for plotting. */
+  /** Most recent BVP waveform (post-transform, detrended), for plotting. */
   signal: Float64Array
   /** Most recent in-band FFT power, for plotting. */
   fft: Float64Array
@@ -19,31 +28,69 @@ export interface HeartRateState {
   freqsBpm: Float64Array
   /** Smoothed BPM across a trailing window of valid estimates. */
   stableBpm: number
+  /** True when stableBpm is fresh enough to display — survives brief
+   *  SNR dips so the number doesn't flicker in and out. */
+  stableReadable: boolean
+  /** Frames since the last moment we had a valid reading. Used by the UI
+   *  to age-out the stable reading after several seconds of signal loss. */
+  framesSinceValid: number
+  /** Which BVP extractor is active for this session. */
+  method: BvpMethod
 }
 
 export class HeartRateEstimator {
   private readonly bufferSize = 100
   private readonly nFft = 1024
-  private readonly snrThreshold = 4
+  // Hysteresis thresholds. Enter valid when SNR rises above snrEnter;
+  // exit only when it drops below snrExit for several consecutive frames.
+  // The gap between enter/exit prevents flapping when the SNR hovers
+  // near the threshold (blinks, small head motion, shadows).
+  private readonly snrEnter = 4
+  private readonly snrExit = 2.5
   private readonly warmupFrames = 10
+  // Frames the SNR must stay below snrExit before we drop out of valid.
+  // ~1 second at 30 fps — absorbs single-frame dips silently.
+  private readonly exitDebounceFrames = 30
+  // Keep the stable BPM readable for this many frames after the last
+  // valid sample. ~5 seconds at 30 fps — long enough that a short blink
+  // doesn't hide the reading, short enough that a genuinely lost signal
+  // times out within a reasonable beat.
+  private readonly staleReadableFrames = 150
+  // Maximum per-frame BPM change we'll accept. Real cardiac activity
+  // doesn't jump by more than ~5 BPM/sec; at 30 FPS a 20 BPM search
+  // half-width gives plenty of headroom while still rejecting the
+  // noise-peak jumps (50s → 170s) that FFT argmax can produce.
+  private readonly maxDeltaBpm = 20
+  // Soft Gaussian bias sigma — when two peaks within the prior window are
+  // comparable in amplitude, this pulls the argmax toward the prior.
+  // Gentle within ~10 BPM, strong beyond ~20 BPM.
+  private readonly priorSigmaBpm = 12
+  // Minimum number of valid BPMs we need accumulated before trusting the
+  // stable median as an anchor. Before this many, the rate limiter does
+  // nothing.
+  private readonly minValidForAnchor = 8
 
-  // Rolling buffer of green-channel means and their wall-clock timestamps (s).
-  private samples: number[] = []
+  // Rolling RGB buffers (channel means over the cheek ROIs) and their
+  // wall-clock timestamps in seconds.
+  private rBuf: number[] = []
+  private gBuf: number[] = []
+  private bBuf: number[] = []
   private timestamps: number[] = []
 
   private framesSinceFull = 0
   private validBpms: number[] = []
+  private method: BvpMethod
 
-  private state: HeartRateState = {
-    bpm: 0,
-    snr: 0,
-    valid: false,
-    fps: 0,
-    warmup: 0,
-    signal: new Float64Array(0),
-    fft: new Float64Array(0),
-    freqsBpm: new Float64Array(0),
-    stableBpm: 0,
+  // Hysteresis state.
+  private lastValid = false
+  private framesBelowExit = 0
+  private framesSinceValid = Infinity
+
+  private state: HeartRateState
+
+  constructor(method: BvpMethod = 'POS') {
+    this.method = method
+    this.state = this.makeInitialState()
   }
 
   /** Returns a read-only snapshot of the latest estimator state. */
@@ -51,54 +98,76 @@ export class HeartRateEstimator {
     return this.state
   }
 
+  /** Current anchor BPM for the rate limiter. null until we have enough
+   *  valid samples to form a trustworthy reference — cold-start searches
+   *  the full band so we can find the HR from scratch. Once we've got a
+   *  stable reference we prefer the median of recent valid BPMs. */
+  private currentAnchor(): number | null {
+    if (this.validBpms.length < this.minValidForAnchor) return null
+    const sorted = [...this.validBpms].sort((a, b) => a - b)
+    return sorted[Math.floor(sorted.length / 2)]
+  }
+
+  setMethod(method: BvpMethod) {
+    if (method === this.method) return
+    this.method = method
+    this.reset()
+  }
+
   reset() {
-    this.samples = []
+    this.rBuf = []
+    this.gBuf = []
+    this.bBuf = []
     this.timestamps = []
     this.framesSinceFull = 0
     this.validBpms = []
-    this.state = {
-      bpm: 0,
-      snr: 0,
-      valid: false,
-      fps: 0,
-      warmup: 0,
-      signal: new Float64Array(0),
-      fft: new Float64Array(0),
-      freqsBpm: new Float64Array(0),
-      stableBpm: 0,
-    }
+    this.lastValid = false
+    this.framesBelowExit = 0
+    this.framesSinceValid = Infinity
+    this.state = this.makeInitialState()
   }
 
   /**
-   * Feed one frame's green-channel mean into the estimator. Returns the
-   * updated state for convenience. Timestamp is seconds-since-anything
-   * monotonic (e.g. performance.now() / 1000).
+   * Feed one frame's RGB channel means into the estimator. Returns the
+   * updated state. Timestamp is seconds-since-anything monotonic
+   * (e.g. performance.now() / 1000).
    */
-  pushSample(green: number, tSeconds: number): HeartRateState {
-    if (!Number.isFinite(green)) return this.state
-    // Outlier clamp — matches Python process.py guard against sudden jumps
-    // (e.g. when a finger brushes the ROI). Once the buffer is full and a
-    // new sample differs from the running mean by more than 10, fall back
-    // to the previous sample so the buffer doesn't get poisoned.
-    const L = this.samples.length
+  pushRgb(r: number, g: number, b: number, tSeconds: number): HeartRateState {
+    if (!Number.isFinite(r) || !Number.isFinite(g) || !Number.isFinite(b)) {
+      return this.state
+    }
+
+    // Outlier clamp on the green channel (most sensitive to sudden skin
+    // changes). Matches the Python process.py guard: once the buffer is
+    // full, a new green value more than 10 off the running mean is
+    // replaced with the last accepted sample so the buffer doesn't get
+    // poisoned by e.g. a finger brushing the ROI.
+    const L = this.gBuf.length
     if (L > 99) {
       let mean = 0
-      for (let i = 0; i < L; i++) mean += this.samples[i]
+      for (let i = 0; i < L; i++) mean += this.gBuf[i]
       mean /= L
-      if (Math.abs(green - mean) > 10) {
-        green = this.samples[L - 1]
+      if (Math.abs(g - mean) > 10) {
+        r = this.rBuf[L - 1]
+        g = this.gBuf[L - 1]
+        b = this.bBuf[L - 1]
       }
     }
-    this.samples.push(green)
+
+    this.rBuf.push(r)
+    this.gBuf.push(g)
+    this.bBuf.push(b)
     this.timestamps.push(tSeconds)
 
     // Keep the buffer bounded.
-    if (this.samples.length > this.bufferSize) {
-      this.samples.shift()
+    if (this.gBuf.length > this.bufferSize) {
+      this.rBuf.shift()
+      this.gBuf.shift()
+      this.bBuf.shift()
       this.timestamps.shift()
     }
 
-    const len = this.samples.length
+    const len = this.gBuf.length
     const warmup = Math.min(1, len / this.bufferSize)
 
     if (len < this.bufferSize) {
@@ -112,27 +181,99 @@ export class HeartRateEstimator {
       return this.state
     }
 
-    // Full buffer: run the DSP pipeline.
-    const buf = new Float64Array(this.samples)
+    // Full buffer: derive the BVP signal, then run the DSP pipeline.
+    const rArr = new Float64Array(this.rBuf)
+    const gArr = new Float64Array(this.gBuf)
+    const bArr = new Float64Array(this.bBuf)
     const ts = new Float64Array(this.timestamps)
-    const est = estimateBpm(buf, ts, this.nFft)
+
+    // Estimate fps from the actual sample timestamps so POS uses the
+    // same window length the downstream FFT assumes.
+    const duration = ts[ts.length - 1] - ts[0]
+    const fps = duration > 0 ? (len - 1) / duration : 30
+
+    // Compute only the BVPs the selected method needs. Each extractor
+    // produces signals on different amplitude scales (POS ~ 1e-3, CHROM ~ 1,
+    // GREEN ~ 130), so when averaging we first z-score each component to
+    // unit variance — otherwise the largest-magnitude component dominates
+    // the sum, which would make e.g. POS+GREEN effectively just GREEN.
+    const bvp = computeBvp(this.method, rArr, gArr, bArr, fps)
+
+    // If we have enough history for a stable anchor, pass it as the prior
+    // so the FFT peak search is restricted to a physiologically plausible
+    // ±20 BPM window around it (hard cap) AND softly Gaussian-biased
+    // toward the prior inside that window (tie-break between close peaks).
+    // This kills both the big noise-jumps (50s → 170s) and the smaller
+    // wander from argmax toggling between two near-equal peaks.
+    // Cold-start (no anchor yet): let the search roam the full band.
+    const anchor = this.currentAnchor()
+    const est = estimateBpm(
+      bvp,
+      ts,
+      this.nFft,
+      undefined,
+      undefined,
+      anchor,
+      this.maxDeltaBpm,
+      anchor !== null ? this.priorSigmaBpm : null
+    )
 
     this.framesSinceFull++
     const pastWarmup = this.framesSinceFull >= this.warmupFrames
-    const valid = pastWarmup && est.snr >= this.snrThreshold
+
+    // Hysteresis gate. pastWarmup is a hard prerequisite; once past it,
+    // whether we emit valid depends on (a) the previous state, (b) where
+    // SNR is relative to snrEnter / snrExit, and (c) how long it's been
+    // below the exit threshold.
+    let valid = this.lastValid
+    if (!pastWarmup) {
+      valid = false
+      this.framesBelowExit = 0
+    } else if (!this.lastValid) {
+      // Currently invalid; only enter when SNR rises above the enter
+      // threshold. Reset the below-exit counter so a fresh acquisition
+      // starts from zero tolerance.
+      if (est.snr >= this.snrEnter) {
+        valid = true
+        this.framesBelowExit = 0
+      }
+    } else {
+      // Currently valid; exit only after SNR has been below the exit
+      // threshold for enough consecutive frames to be confident the
+      // signal actually dropped (vs a blink, brief shadow, etc).
+      if (est.snr < this.snrExit) {
+        this.framesBelowExit++
+        if (this.framesBelowExit >= this.exitDebounceFrames) {
+          valid = false
+          this.framesBelowExit = 0
+        }
+      } else {
+        // Any frame at or above the exit threshold resets the exit
+        // debounce counter.
+        this.framesBelowExit = 0
+      }
+    }
 
     if (valid) {
       this.validBpms.push(est.bpm)
       if (this.validBpms.length > this.bufferSize / 2) this.validBpms.shift()
+      this.framesSinceValid = 0
+    } else {
+      this.framesSinceValid++
     }
+    this.lastValid = valid
 
-    // Stable BPM: median of last N valid samples. More robust to one
-    // outlier bin than the raw mean used in the Python GUI.
     let stable = 0
     if (this.validBpms.length >= 25) {
       const sorted = [...this.validBpms].sort((a, b) => a - b)
       stable = sorted[Math.floor(sorted.length / 2)]
     }
+
+    // The stable BPM is readable whenever we have a recent-enough stream
+    // of valid samples — it survives momentary SNR dips so the UI
+    // doesn't blink the number off and on every time you breathe.
+    const stableReadable =
+      stable > 0 && this.framesSinceValid <= this.staleReadableFrames
 
     this.state = {
       bpm: est.bpm,
@@ -140,11 +281,108 @@ export class HeartRateEstimator {
       valid,
       fps: est.fps,
       warmup: 1,
-      signal: buf,
+      signal: bvp,
       fft: est.fft,
       freqsBpm: est.freqsBpm,
       stableBpm: stable,
+      stableReadable,
+      framesSinceValid: this.framesSinceValid,
+      method: this.method,
     }
     return this.state
+  }
+
+  /**
+   * Backwards-compat thin shim — callers that only have a green-channel
+   * mean can still push it. Fills R and B with the green value, which
+   * makes POS collapse to a noisy near-zero signal. Useful for unit
+   * tests that pre-date the RGB API; not for production callers.
+   */
+  pushSample(green: number, tSeconds: number): HeartRateState {
+    return this.pushRgb(green, green, green, tSeconds)
+  }
+
+  private makeInitialState(): HeartRateState {
+    return {
+      bpm: 0,
+      snr: 0,
+      valid: false,
+      fps: 0,
+      warmup: 0,
+      signal: new Float64Array(0),
+      fft: new Float64Array(0),
+      freqsBpm: new Float64Array(0),
+      stableBpm: 0,
+      stableReadable: false,
+      framesSinceValid: Infinity,
+      method: this.method,
+    }
+  }
+}
+
+// Z-score a signal to zero mean, unit variance. If the series is
+// essentially constant (std ≈ 0), return a zero-filled array rather than
+// dividing by zero — averaging that into a hybrid just adds nothing.
+function zscore(v: Float64Array): Float64Array {
+  const n = v.length
+  if (n === 0) return new Float64Array(0)
+  let mean = 0
+  for (let i = 0; i < n; i++) mean += v[i]
+  mean /= n
+  let varSum = 0
+  for (let i = 0; i < n; i++) {
+    const d = v[i] - mean
+    varSum += d * d
+  }
+  const std = Math.sqrt(varSum / n)
+  const out = new Float64Array(n)
+  if (std < 1e-9) return out
+  for (let i = 0; i < n; i++) out[i] = (v[i] - mean) / std
+  return out
+}
+
+/** Sum two or three z-scored signals, pre-allocated output length = n. */
+function meanOf(parts: Float64Array[]): Float64Array {
+  const n = parts[0].length
+  const out = new Float64Array(n)
+  for (const p of parts) {
+    for (let i = 0; i < n; i++) out[i] += p[i]
+  }
+  const k = parts.length
+  for (let i = 0; i < n; i++) out[i] /= k
+  return out
+}
+
+function computeBvp(
+  method: BvpMethod,
+  r: Float64Array,
+  g: Float64Array,
+  b: Float64Array,
+  fps: number
+): Float64Array {
+  // Lazy cache so hybrids don't compute POS/CHROM twice. Only computed
+  // for the components the selected method needs.
+  let pos: Float64Array | null = null
+  let chrom: Float64Array | null = null
+  const getPos = () => pos ?? (pos = posTransform(r, g, b, fps))
+  const getChrom = () => chrom ?? (chrom = chromTransform(r, g, b))
+
+  switch (method) {
+    case 'POS':
+      return getPos()
+    case 'CHROM':
+      return getChrom()
+    case 'GREEN':
+      return g
+    case 'POS+CHROM':
+      return meanOf([zscore(getPos()), zscore(getChrom())])
+    case 'POS+GREEN':
+      return meanOf([zscore(getPos()), zscore(g)])
+    case 'CHROM+GREEN':
+      return meanOf([zscore(getChrom()), zscore(g)])
+    case 'POS+CHROM+GREEN':
+      return meanOf([zscore(getPos()), zscore(getChrom()), zscore(g)])
+    default:
+      return g
   }
 }

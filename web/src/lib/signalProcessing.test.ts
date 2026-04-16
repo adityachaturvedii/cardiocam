@@ -97,3 +97,40 @@ describe('l2Norm', () => {
     expect(l2Norm(new Float64Array([3, 4]))).toBeCloseTo(5, 9)
   })
 })
+
+describe('estimateBpm with prior bias', () => {
+  const fps = 30
+  const L = 100
+
+  // Build a signal with two peaks: a real pulse at 75 BPM and a slightly
+  // stronger spurious peak at 110 BPM. Unbiased argmax picks 110; the
+  // prior bias centered at 75 should pull us back to 75.
+  const twoPeaks = (): { buf: Float64Array; ts: Float64Array } => {
+    const buf = new Float64Array(L)
+    const ts = new Float64Array(L)
+    for (let i = 0; i < L; i++) {
+      ts[i] = i / fps
+      // Spurious peak is ~20% stronger than the real one.
+      buf[i] =
+        Math.sin(2 * Math.PI * 1.25 * ts[i]) + // 75 BPM
+        1.2 * Math.sin(2 * Math.PI * 1.833 * ts[i]) // 110 BPM
+    }
+    return { buf, ts }
+  }
+
+  it('without a prior, lands on the stronger spurious peak', () => {
+    const { buf, ts } = twoPeaks()
+    const est = estimateBpm(buf, ts, 1024)
+    expect(est.bpm).toBeGreaterThan(105)
+    expect(est.bpm).toBeLessThan(115)
+  })
+
+  it('with a prior at 75 and sigma 12, snaps back to the real peak', () => {
+    const { buf, ts } = twoPeaks()
+    // Wide search window so both peaks are visible to the scorer; the
+    // Gaussian bias is what moves the argmax, not the window clipping.
+    const est = estimateBpm(buf, ts, 1024, 45, 150, 75, 50, 12)
+    expect(est.bpm).toBeGreaterThan(72)
+    expect(est.bpm).toBeLessThan(78)
+  })
+})
