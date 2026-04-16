@@ -299,37 +299,56 @@ export function estimateBpm(
     bandFreqs[i] = (loIdx + i) * binBpm
   }
 
-  // Determine the argmax search window. Without a prior it's the whole
-  // band; with one, a narrower [prior - maxDelta, prior + maxDelta] ∩ band.
+  const { bpm, snr } = pickPeak(
+    bandFft,
+    bandFreqs,
+    priorBpm,
+    maxDeltaBpm,
+    priorSigmaBpm
+  )
+  return { bpm, snr, fft: bandFft, freqsBpm: bandFreqs, fps }
+}
+
+/**
+ * Pick the argmax BPM from an in-band power spectrum, with optional
+ * prior-based window clamp and Gaussian bias. Returns the selected BPM
+ * plus the SNR (peak / in-band median), computed on the RAW spectrum
+ * values so the validity gate reflects genuine spectral strength
+ * regardless of any bias weighting.
+ *
+ * Exposed for callers that maintain their own accumulated spectrum
+ * (e.g. HeartRateEstimator's time-weighted spectrum accumulator) and
+ * want to run peak-picking without re-running the whole FFT.
+ */
+export function pickPeak(
+  bandFft: Float64Array,
+  bandFreqs: Float64Array,
+  priorBpm: number | null,
+  maxDeltaBpm: number,
+  priorSigmaBpm: number | null
+): { bpm: number; snr: number; peakIdx: number } {
+  const bandLen = bandFft.length
   let searchLo = 0
   let searchHi = bandLen - 1
   if (priorBpm !== null && bandLen > 0) {
     const lo = priorBpm - maxDeltaBpm
     const hi = priorBpm + maxDeltaBpm
-    // bandFreqs is monotonically increasing — binary-search-lite by linear
-    // probing since the array is ≤ ~100 elements in the FFT sizes we use.
     let newLo = -1
     let newHi = -1
     for (let i = 0; i < bandLen; i++) {
       if (bandFreqs[i] >= lo && newLo < 0) newLo = i
       if (bandFreqs[i] <= hi) newHi = i
     }
-    // If the prior window has no overlap with the band, fall back to the
-    // whole band rather than returning 0 — happens at cold start when
-    // priorBpm is stale or if the prior wandered way outside the band.
     if (newLo >= 0 && newHi >= newLo) {
       searchLo = newLo
       searchHi = newHi
     }
   }
 
-  // Argmax. Without a prior-bias sigma, we use the raw spectrum directly.
-  // With one, we weight by a Gaussian centered at priorBpm so a slightly
-  // weaker peak near the prior wins over a slightly stronger peak far
-  // from it — but only when the weighted difference is actually smaller.
   let peakIdx = searchLo
   let peakScore = -Infinity
-  const useBias = priorBpm !== null && priorSigmaBpm !== null && priorSigmaBpm > 0
+  const useBias =
+    priorBpm !== null && priorSigmaBpm !== null && priorSigmaBpm > 0
   const sigma = priorSigmaBpm ?? 1
   const sigma2 = 2 * sigma * sigma
   for (let i = searchLo; i <= searchHi; i++) {
@@ -344,14 +363,10 @@ export function estimateBpm(
     }
   }
   const bpm = bandLen > 0 ? bandFreqs[peakIdx] : 0
-  // SNR uses the RAW peak power at the chosen bin (not the biased score),
-  // so the validity gate reflects genuine spectral strength and is
-  // unaffected by the bias weighting.
   const peakVal = bandLen > 0 ? bandFft[peakIdx] : 0
   const median = bandLen > 0 ? medianOf(bandFft) : 0
   const snr = median > 0 && peakVal > 0 ? peakVal / median : 0
-
-  return { bpm, snr, fft: bandFft, freqsBpm: bandFreqs, fps }
+  return { bpm, snr, peakIdx }
 }
 
 /** numpy.interp: monotonically increasing xp assumed. */

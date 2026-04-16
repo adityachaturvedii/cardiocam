@@ -1,13 +1,16 @@
-// Extract the mean R, G, B intensities from two cheek patches.
+// Extract the mean R, G, B intensities from three skin patches
+// (subject-left cheek, subject-right cheek, central forehead).
 //
 // The signal is the three color-channel means over ROI skin pixels, which is
 // rotation-invariant — cropping an axis-aligned rectangle straight from the
 // source frame gives a skin patch that the downstream BVP methods (GREEN,
 // POS, CHROM) can all consume identically.
 //
-// We use polygon fills over MediaPipe Face Mesh cheek landmarks rather than
-// bounding rectangles to avoid catching non-skin pixels (eyebrows, lip edge)
-// at extreme head angles.
+// Multi-region averaging halves MAE on the LGI-PPGI benchmark in the
+// Álvarez Casado 2025 paper — bigger gain than any single algorithm
+// change. We use polygon fills over MediaPipe Face Mesh landmarks rather
+// than bounding rectangles to avoid catching non-skin pixels (eyebrows,
+// lip edge, hairline) at extreme head angles.
 
 import type { NormalizedLandmark } from '@mediapipe/tasks-vision'
 
@@ -20,24 +23,40 @@ import type { NormalizedLandmark } from '@mediapipe/tasks-vision'
 const LEFT_CHEEK_RING = [345, 352, 411, 425, 266, 371, 355]
 // Subject-right cheek (viewer's-left side of the image).
 const RIGHT_CHEEK_RING = [116, 123, 187, 205, 36, 142, 126]
+// Glabella / lower-central-forehead patch. Bounded below by the
+// inner-eyebrow landmarks (107 left, 336 right) and above by the
+// mid-forehead row (66, 69, 151, 299, 296). Intentionally stays in the
+// lower half of the forehead so the polygon never reaches the hairline,
+// which varies by haircut and would contaminate the green mean with
+// hair pixels for many users. The cardiocam ROI visibility overlay lets
+// us verify this empirically per user.
+const FOREHEAD_RING = [107, 66, 69, 151, 299, 296, 336, 9]
 
 export interface CheekSample {
-  /** Mean red channel over both cheek polygons, 0-255. */
+  /** Equal-weighted mean red across all available ROIs, 0-255. */
   r: number
-  /** Mean green channel over both cheek polygons, 0-255. */
+  /** Equal-weighted mean green across all available ROIs, 0-255. */
   g: number
-  /** Mean blue channel over both cheek polygons, 0-255. */
+  /** Equal-weighted mean blue across all available ROIs, 0-255. */
   b: number
   /** Alias for g — keeps the old green-only pipeline trivially backwards compatible. */
   greenMean: number
   leftArea: number
   rightArea: number
+  /** Number of pixels that contributed to the forehead mean. 0 if the
+   *  forehead polygon fell outside the frame or degenerated to zero area. */
+  foreheadArea: number
 }
 
 /**
- * Sample the two cheek ROIs from the current video frame and return the
- * per-channel means. Returns null if either ROI ends up with no pixels
- * (face partly off-frame).
+ * Sample the three skin ROIs (both cheeks + central forehead) from the
+ * current video frame and return their equal-weighted per-channel means.
+ * Returns null if BOTH cheek ROIs fail — forehead alone is not enough
+ * because it's often occluded by hair/bangs on real users.
+ *
+ * Forehead is included when its polygon yields pixels; if the forehead
+ * falls off-frame (e.g. phone held low) we still return a valid sample
+ * using just the cheeks.
  */
 export function sampleCheekRgb(
   landmarks: NormalizedLandmark[],
@@ -45,23 +64,34 @@ export function sampleCheekRgb(
   frameWidth: number,
   frameHeight: number
 ): CheekSample | null {
-  const leftPoly = LEFT_CHEEK_RING.map((i) => ({
+  const pointAt = (i: number) => ({
     x: landmarks[i].x * frameWidth,
     y: landmarks[i].y * frameHeight,
-  }))
-  const rightPoly = RIGHT_CHEEK_RING.map((i) => ({
-    x: landmarks[i].x * frameWidth,
-    y: landmarks[i].y * frameHeight,
-  }))
+  })
+  const leftPoly = LEFT_CHEEK_RING.map(pointAt)
+  const rightPoly = RIGHT_CHEEK_RING.map(pointAt)
+  const foreheadPoly = FOREHEAD_RING.map(pointAt)
 
   const left = meanRgbInPolygon(ctx, leftPoly, frameWidth, frameHeight)
   const right = meanRgbInPolygon(ctx, rightPoly, frameWidth, frameHeight)
+  const forehead = meanRgbInPolygon(ctx, foreheadPoly, frameWidth, frameHeight)
   if (left === null || right === null) return null
 
-  // Equal-weight average across both cheeks.
-  const r = (left.r + right.r) / 2
-  const g = (left.g + right.g) / 2
-  const b = (left.b + right.b) / 2
+  // Equal-weight average across available ROIs. Both cheeks are always
+  // present once we're past the null check above; forehead is optional.
+  const parts = [left, right]
+  if (forehead !== null) parts.push(forehead)
+  let r = 0
+  let g = 0
+  let b = 0
+  for (const p of parts) {
+    r += p.r
+    g += p.g
+    b += p.b
+  }
+  r /= parts.length
+  g /= parts.length
+  b /= parts.length
 
   return {
     r,
@@ -70,6 +100,7 @@ export function sampleCheekRgb(
     greenMean: g,
     leftArea: left.area,
     rightArea: right.area,
+    foreheadArea: forehead?.area ?? 0,
   }
 }
 
@@ -148,4 +179,4 @@ function pointInPolygon(
   return inside
 }
 
-export { LEFT_CHEEK_RING, RIGHT_CHEEK_RING }
+export { LEFT_CHEEK_RING, RIGHT_CHEEK_RING, FOREHEAD_RING }
