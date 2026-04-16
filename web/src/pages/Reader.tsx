@@ -13,6 +13,7 @@ import {
   RIGHT_CHEEK_RING,
   sampleCheekRgb,
 } from '../lib/roi'
+import { LandmarkFilter } from '../lib/landmarkFilter'
 import Footer from '../components/Footer'
 import HeartIcon from '../components/HeartIcon'
 import SignalPlot from '../components/SignalPlot'
@@ -40,6 +41,10 @@ export default function Reader() {
   const samplingCanvasRef = useRef<HTMLCanvasElement | null>(null)
   const rafRef = useRef<number | null>(null)
   const estimatorRef = useRef<HeartRateEstimator>(new HeartRateEstimator())
+  // Alpha-Beta filter over the 478 face-mesh landmarks. Absorbs per-frame
+  // jitter in landmark positions so the polygon ROIs don't wiggle pixel
+  // by pixel (which would leak into the BVP as noise).
+  const landmarkFilterRef = useRef<LandmarkFilter>(new LandmarkFilter())
 
   const [faceDetected, setFaceDetected] = useState(false)
   const [fps, setFps] = useState(0)
@@ -82,19 +87,20 @@ export default function Reader() {
       const faces = result.faceLandmarks
       if (faces && faces.length > 0) {
         setFaceDetected(true)
-        const lm = faces[0]
+        // Alpha-Beta smooth the landmarks before anything else consumes
+        // them — ROI polygons and sampling both benefit.
+        const lm = landmarkFilterRef.current.stabilize(faces[0], now)
         drawPolygon(overlayCtx, LEFT_CHEEK_RING, lm, vw, vh)
         drawPolygon(overlayCtx, RIGHT_CHEEK_RING, lm, vw, vh)
         drawPolygon(overlayCtx, FOREHEAD_RING, lm, vw, vh)
 
         const sample = sampleCheekRgb(lm, samplingCtx, vw, vh)
         if (sample) {
-          const state = estimatorRef.current.pushRgb(
-            sample.r,
-            sample.g,
-            sample.b,
-            now / 1000
-          )
+          // pushRegional gives the estimator per-region RGB streams so
+          // the per-region SNR-weighted spectrum combination kicks in.
+          // Falls back to the old single-stream behavior internally when
+          // a region is missing for too many frames.
+          const state = estimatorRef.current.pushRegional(sample, now / 1000)
           setHr(state)
         }
       } else {
@@ -126,6 +132,7 @@ export default function Reader() {
 
   const onStart = () => {
     estimatorRef.current.reset()
+    landmarkFilterRef.current.reset()
     setHr(INITIAL_HR_STATE)
     camera.start()
   }
@@ -136,6 +143,7 @@ export default function Reader() {
     }
     camera.stop()
     estimatorRef.current.reset()
+    landmarkFilterRef.current.reset()
     setFaceDetected(false)
     setFps(0)
     setHr(INITIAL_HR_STATE)
@@ -148,6 +156,7 @@ export default function Reader() {
     camera.setDeviceId(id)
     if (camera.state.status === 'running') {
       estimatorRef.current.reset()
+    landmarkFilterRef.current.reset()
       setHr(INITIAL_HR_STATE)
       camera.start(id)
     }
@@ -297,6 +306,7 @@ export default function Reader() {
                 >
                   <option value="POS">POS</option>
                   <option value="CHROM">CHROM</option>
+                  <option value="OMIT">OMIT</option>
                   <option value="GREEN">GREEN</option>
                   <option value="POS+CHROM">POS + CHROM</option>
                   <option value="POS+GREEN">POS + GREEN</option>

@@ -1,14 +1,17 @@
 import {
   chromTransform,
   estimateBpm,
+  omitTransform,
   pickPeak,
   posTransform,
 } from './signalProcessing'
+import type { CheekSample } from './roi'
 
 export type BvpMethod =
   | 'GREEN'
   | 'POS'
   | 'CHROM'
+  | 'OMIT'
   | 'POS+CHROM'
   | 'POS+GREEN'
   | 'CHROM+GREEN'
@@ -93,12 +96,30 @@ export class HeartRateEstimator {
   private readonly bpmEwmaHalfLifeFrames = 90 // 3s at 30 fps
   private ewmaBpm: number | null = null
 
-  // Rolling RGB buffers (channel means over the cheek ROIs) and their
-  // wall-clock timestamps in seconds.
+  // Rolling RGB buffers (channel means over the combined ROIs) and their
+  // wall-clock timestamps in seconds. Kept for the single-region fallback
+  // path via pushRgb.
   private rBuf: number[] = []
   private gBuf: number[] = []
   private bBuf: number[] = []
   private timestamps: number[] = []
+
+  // Per-region RGB buffers — populated only when pushRegional is used.
+  // Forehead buffer holds the fallback averaged value (cheek mean) on
+  // frames where the forehead polygon was empty, so the length always
+  // matches the cheeks. A parallel mask tracks which frames had a real
+  // forehead measurement so its BVP can be weighted by data availability.
+  private perRegionActive = false
+  private rBufL: number[] = []
+  private gBufL: number[] = []
+  private bBufL: number[] = []
+  private rBufR: number[] = []
+  private gBufR: number[] = []
+  private bBufR: number[] = []
+  private rBufF: number[] = []
+  private gBufF: number[] = []
+  private bBufF: number[] = []
+  private foreheadMask: boolean[] = []
 
   private framesSinceFull = 0
   private validBpms: number[] = []
@@ -142,6 +163,17 @@ export class HeartRateEstimator {
     this.gBuf = []
     this.bBuf = []
     this.timestamps = []
+    this.rBufL = []
+    this.gBufL = []
+    this.bBufL = []
+    this.rBufR = []
+    this.gBufR = []
+    this.bBufR = []
+    this.rBufF = []
+    this.gBufF = []
+    this.bBufF = []
+    this.foreheadMask = []
+    this.perRegionActive = false
     this.framesSinceFull = 0
     this.validBpms = []
     this.lastValid = false
@@ -150,6 +182,61 @@ export class HeartRateEstimator {
     this.accumSpectrum = null
     this.ewmaBpm = null
     this.state = this.makeInitialState()
+  }
+
+  /**
+   * Preferred entry point when per-region samples are available. Records
+   * both the combined-mean stream (for compatibility + plotting) AND the
+   * three per-region RGB streams, enabling SNR-weighted combination of
+   * per-region BVPs on the full-buffer step.
+   *
+   * Forehead is optional: if the polygon falls off-frame, the caller's
+   * sample.forehead is null and we fill the buffer with the cheek average
+   * so the lengths stay aligned, flagging the frame as "no forehead"
+   * in the parallel mask. Regions with insufficient valid frames in the
+   * buffer automatically drop out of the weighted combination.
+   */
+  pushRegional(sample: CheekSample, tSeconds: number): HeartRateState {
+    this.perRegionActive = true
+
+    // Combined path: feed the averaged mean through the legacy buffer so
+    // the hybrid methods (which expect a single RGB stream) keep working.
+    // pushRgb handles outlier clamping and buffer bounding.
+    const headState = this.pushRgb(sample.r, sample.g, sample.b, tSeconds)
+
+    // Per-region streams: append, keep in lockstep with the combined
+    // buffer (same trim rule). No outlier clamp per region — the combined
+    // stream already absorbs glitches at the signal level.
+    this.rBufL.push(sample.left.r)
+    this.gBufL.push(sample.left.g)
+    this.bBufL.push(sample.left.b)
+    this.rBufR.push(sample.right.r)
+    this.gBufR.push(sample.right.g)
+    this.bBufR.push(sample.right.b)
+    if (sample.forehead !== null) {
+      this.rBufF.push(sample.forehead.r)
+      this.gBufF.push(sample.forehead.g)
+      this.bBufF.push(sample.forehead.b)
+      this.foreheadMask.push(true)
+    } else {
+      this.rBufF.push(sample.r)
+      this.gBufF.push(sample.g)
+      this.bBufF.push(sample.b)
+      this.foreheadMask.push(false)
+    }
+    while (this.rBufL.length > this.bufferSize) {
+      this.rBufL.shift()
+      this.gBufL.shift()
+      this.bBufL.shift()
+      this.rBufR.shift()
+      this.gBufR.shift()
+      this.bBufR.shift()
+      this.rBufF.shift()
+      this.gBufF.shift()
+      this.bBufF.shift()
+      this.foreheadMask.shift()
+    }
+    return headState
   }
 
   /**
@@ -228,7 +315,80 @@ export class HeartRateEstimator {
     // combine this instantaneous spectrum with an exponentially-decayed
     // historical spectrum and pick from the accumulator. Passing no prior
     // here means estimateBpm returns the full in-band spectrum unbiased.
-    const inst = estimateBpm(bvp, ts, this.nFft)
+    let inst = estimateBpm(bvp, ts, this.nFft)
+
+    // Per-region SNR-weighted combination. When pushRegional has been
+    // fed frames, each of the three ROI buffers has the same length as
+    // the combined buffer. We run the current BVP method on each region
+    // separately, score each region's in-band FFT by its peak/median
+    // SNR, and blend the three spectra weighted by SNR^2 (sharper
+    // weighting than linear; a region with 2× the SNR contributes 4×).
+    // A region with effectively zero valid frames (forehead hidden
+    // behind hair/bangs) contributes 0 and effectively drops out.
+    if (
+      this.perRegionActive &&
+      this.rBufL.length === len &&
+      this.rBufR.length === len &&
+      this.rBufF.length === len
+    ) {
+      const bvpL = computeBvp(
+        this.method,
+        new Float64Array(this.rBufL),
+        new Float64Array(this.gBufL),
+        new Float64Array(this.bBufL),
+        fps
+      )
+      const bvpR = computeBvp(
+        this.method,
+        new Float64Array(this.rBufR),
+        new Float64Array(this.gBufR),
+        new Float64Array(this.bBufR),
+        fps
+      )
+      // Only use the forehead region if enough frames in the buffer had
+      // a real forehead measurement (>= 60% threshold). Otherwise hair
+      // occlusion dominates and the forehead signal is noise.
+      let foreheadCount = 0
+      for (let i = 0; i < this.foreheadMask.length; i++) {
+        if (this.foreheadMask[i]) foreheadCount++
+      }
+      const useForehead = foreheadCount / this.foreheadMask.length >= 0.6
+      const bvpF = useForehead
+        ? computeBvp(
+            this.method,
+            new Float64Array(this.rBufF),
+            new Float64Array(this.gBufF),
+            new Float64Array(this.bBufF),
+            fps
+          )
+        : null
+
+      const estL = estimateBpm(bvpL, ts, this.nFft)
+      const estR = estimateBpm(bvpR, ts, this.nFft)
+      const estF = bvpF ? estimateBpm(bvpF, ts, this.nFft) : null
+
+      // SNR-squared weighting. Scale is invariant — we normalize below.
+      const wL = estL.snr * estL.snr
+      const wR = estR.snr * estR.snr
+      const wF = estF ? estF.snr * estF.snr : 0
+      const totalW = wL + wR + wF
+      if (totalW > 0 && estL.fft.length === estR.fft.length) {
+        const combined = new Float64Array(estL.fft.length)
+        for (let i = 0; i < combined.length; i++) {
+          let v = wL * estL.fft[i] + wR * estR.fft[i]
+          if (estF) v += wF * estF.fft[i]
+          combined[i] = v / totalW
+        }
+        // Keep the same freqs axis and fps from the first sub-estimate.
+        inst = {
+          bpm: estL.bpm, // will be overwritten by the accumulator peak pick
+          snr: estL.snr, // ditto
+          fft: combined,
+          freqsBpm: estL.freqsBpm,
+          fps: estL.fps,
+        }
+      }
+    }
 
     // Update the running accumulated spectrum. Initialize on first call
     // (or after a reset / method change / band length change). Decay
@@ -437,6 +597,8 @@ function computeBvp(
       return getPos()
     case 'CHROM':
       return getChrom()
+    case 'OMIT':
+      return omitTransform(r, g, b)
     case 'GREEN':
       return g
     case 'POS+CHROM':
