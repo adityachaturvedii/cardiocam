@@ -1,44 +1,125 @@
-# Heart-rate-measurement-using-camera
-[![Alt text](https://github.com/habom2310/Heart-rate-measurement-using-camera/blob/master/result.JPG)](https://youtu.be/JeQGSEXk_BQ)
-# Abstract
-- Heart Rate (HR) is one of the most important Physiological parameter and a vital indicator of people‘s physiological state
-- A non-contact based system to measure Heart Rate: real-time application using camera
-- Principal: extract heart rate information from facial skin color variation caused by blood circulation 
-- Application: monitoring drivers‘ physiological state
+# cardiocam
 
-# Methods 
-- Detect face, align and get ROI using facial landmarks
-- Apply band pass filter with fl = 0.8 Hz and fh = 3 Hz, which are 48 and 180 bpm respectively
-- Average color value of ROI in each frame is calculate pushed to a data buffer which is 150 in length
-- FFT the data buffer. The highest peak is Heart rate
-- Amplify color to make the color variation visible 
+Measure your heart rate from a webcam. Runs entirely in your browser — no
+install, no upload, no server.
 
-# Requirements
+**Live app:** https://adityachaturvedii.github.io/cardiocam/
+
+cardiocam implements remote photoplethysmography (rPPG): subtle
+pulse-driven color changes in the skin of your face are extracted from
+video and turned into a BPM estimate in real time. The algorithm pipeline
+follows well-established methods from the rPPG literature; all
+computation happens on-device via MediaPipe (GPU-accelerated where
+available) and a small TypeScript DSP core.
+
+> Not a medical device. cardiocam is a research and demo project — do not
+> use its readings for diagnosis or treatment decisions.
+
+## How it works
+
+1. **Face tracking** — MediaPipe Face Mesh gives 478 landmarks per frame.
+   Two cheek-apex polygons are derived from the zygomatic region and
+   sampled each frame for R, G, B means.
+2. **BVP extraction** — the RGB time series is transformed into a blood
+   volume pulse signal. Multiple methods are available:
+   - **POS** (Wang et al., 2017) — plane-orthogonal-to-skin projection,
+     default. Cancels specular reflections and common-mode illumination
+     drift.
+   - **CHROM** (de Haan & Jeanne, 2013) — chrominance subtraction. Older
+     and simpler, still competitive on stable scenes.
+   - **GREEN** (Verkruysse et al., 2008) — green-channel mean. Baseline.
+   - Plus four hybrid modes that z-score and average the pure methods.
+3. **BPM estimation** — detrend → Hamming window → zero-padded FFT (1024
+   bins over ~3.3 s) → argmax inside the 45–150 BPM band.
+4. **Stability** — once enough valid samples have accumulated, the peak
+   search is clamped to `±20 BPM` of the rolling median and softly
+   biased toward it. An SNR gate with hysteresis (enter at 4, exit at
+   2.5, with a ~1 s debounce) decides when to trust the reading, and a
+   rolling median of recent valid BPMs is displayed.
+
+## Running the web app locally
+
+```bash
+cd web
+npm install
+npm run dev
 ```
+
+Then open http://localhost:5173/. Grant camera access when prompted. The
+`Method` dropdown lets you A/B the seven BVP modes.
+
+### Tests
+
+```bash
+cd web
+npm test
+```
+
+16 unit tests cover the DSP pipeline: detrend, Hamming window, FFT peak
+detection with and without prior-biased search, POS and CHROM synthetic
+recovery, and SNR on noise vs signal.
+
+### Production build
+
+```bash
+cd web
+npm run build
+```
+
+The output under `web/dist/` is a ~400 KB static bundle (+ a 3.6 MB
+MediaPipe model loaded lazily from `/models/`). GitHub Pages builds and
+deploys `web/**` on every push to `master` via `.github/workflows/deploy-web.yml`.
+
+## Python reference implementation
+
+A PyQt5 desktop app lives at the repo root. It predates the web port and
+is retained as a reference — same signal pipeline, slightly different
+stability defaults. Not the recommended way to use cardiocam.
+
+```bash
+python3.10 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
-```
-
-
-# Implementation
-```
 python GUI.py
 ```
-- In case of plotting graphs, run "graph_plot.py" 
-- For the Eulerian Video Magnification implementation, run "amplify_color.py"
 
-# Results
-- Data from a specialized device, Compact 5 medical Econet, is used for the ground truth. In certain circumstances, the Heart rate values measured using the application and the device are the same
+Requires a Python 3.10 virtualenv because of MediaPipe's build wheels.
 
-# Reference
-- Real Time Heart Rate Monitoring From Facial RGB Color Video Using Webcam by H. Rahman, M.U. Ahmed, S. Begum, P. Funk
-- Remote Monitoring of Heart Rate using Multispectral Imaging in Group 2, 18-551, Spring 2015 by Michael Kellman Carnegie (Mellon University), Sophia Zikanova (Carnegie Mellon University) and Bryan Phipps (Carnegie Mellon University)
-- Non-contact, automated cardiac pulse measurements using video imaging and blind source separation by Ming-Zher Poh, Daniel J. McDuff, and Rosalind W. Picard
-- Camera-based Heart Rate Monitoring by Janus Nørtoft Jensen and Morten Hannemose
-- Graphs plotting is based on https://github.com/thearn/webcam-pulse-detector
-- https://www.pyimagesearch.com/2017/04/03/facial-landmarks-dlib-opencv-python/
+## Project structure
 
-# Note
-- Application can only detect HR for 1 people at a time
-- Sudden change can cause incorrect HR calculation. In the most case, HR can be correctly detected after 10 seconds being stable infront of the camera
-- This github project is for study purpose only. For other purposes, please contact me at khanhhanguyen2310@gmail.com
+```
+.
+├── web/                     Browser app (primary artifact)
+│   ├── src/lib/             DSP core — BVP methods, FFT, estimator
+│   ├── src/pages/           Landing + Reader
+│   ├── src/components/      Plots, heart icon, footer
+│   └── public/models/       Vendored MediaPipe face_landmarker.task
+├── literature/              Survey notes + rPPG benchmark references
+├── findings.md              Running notes on accuracy decisions
+├── GUI.py                   Python reference implementation
+└── mediapipe_face.py        Python MediaPipe wrapper
+```
 
+## References
+
+- Verkruysse, W., Svaasand, L. O., & Nelson, J. S. (2008). "Remote
+  plethysmographic imaging using ambient light." *Optics Express*,
+  16(26), 21434–21445.
+- Poh, M.-Z., McDuff, D. J., & Picard, R. W. (2010). "Non-contact,
+  automated cardiac pulse measurements using video imaging and blind
+  source separation." *Optics Express*, 18(10), 10762–10774.
+  [doi:10.1364/OE.18.010762](https://doi.org/10.1364/OE.18.010762)
+- de Haan, G., & Jeanne, V. (2013). "Robust pulse rate from
+  chrominance-based rPPG." *IEEE TBME*, 60(10), 2878–2886.
+  [doi:10.1109/TBME.2013.2266196](https://doi.org/10.1109/TBME.2013.2266196)
+- Wang, W., den Brinker, A. C., Stuijk, S., & de Haan, G. (2017).
+  "Algorithmic principles of remote PPG." *IEEE TBME*, 64(7), 1479–1491.
+  [doi:10.1109/TBME.2016.2609282](https://doi.org/10.1109/TBME.2016.2609282)
+- Liu, X. et al. (2023). "rPPG-Toolbox: Deep Remote PPG Toolbox."
+  *NeurIPS 2023* ([arXiv:2210.00716](https://arxiv.org/abs/2210.00716)).
+  Source of the cross-dataset MAE figures that informed the method
+  choice — see `literature/03-rppg-toolbox-benchmark-table.md`.
+
+## License
+
+MIT.
