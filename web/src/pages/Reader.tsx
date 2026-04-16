@@ -2,11 +2,15 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useCamera } from '../hooks/useCamera'
 import { useFaceLandmarker } from '../hooks/useFaceLandmarker'
-import { HeartRateEstimator, type HeartRateState } from '../lib/heartRate'
+import {
+  HeartRateEstimator,
+  type BvpMethod,
+  type HeartRateState,
+} from '../lib/heartRate'
 import {
   LEFT_CHEEK_RING,
   RIGHT_CHEEK_RING,
-  sampleCheekGreen,
+  sampleCheekRgb,
 } from '../lib/roi'
 import Footer from '../components/Footer'
 import HeartIcon from '../components/HeartIcon'
@@ -23,6 +27,9 @@ const INITIAL_HR_STATE: HeartRateState = {
   fft: new Float64Array(0),
   freqsBpm: new Float64Array(0),
   stableBpm: 0,
+  stableReadable: false,
+  framesSinceValid: Infinity,
+  method: 'POS',
 }
 
 export default function Reader() {
@@ -36,6 +43,10 @@ export default function Reader() {
   const [faceDetected, setFaceDetected] = useState(false)
   const [fps, setFps] = useState(0)
   const [hr, setHr] = useState<HeartRateState>(INITIAL_HR_STATE)
+  // BVP extractor choice. POS by default; GREEN exists so a user can A/B
+  // against the pre-Apr-2026 behavior on their own face. Swapping resets
+  // the estimator because the two methods' signal shapes differ.
+  const [method, setMethodState] = useState<BvpMethod>('POS')
 
   const runLoop = useCallback(() => {
     const video = camera.videoRef.current
@@ -74,10 +85,12 @@ export default function Reader() {
         drawPolygon(overlayCtx, LEFT_CHEEK_RING, lm, vw, vh)
         drawPolygon(overlayCtx, RIGHT_CHEEK_RING, lm, vw, vh)
 
-        const sample = sampleCheekGreen(lm, samplingCtx, vw, vh)
+        const sample = sampleCheekRgb(lm, samplingCtx, vw, vh)
         if (sample) {
-          const state = estimatorRef.current.pushSample(
-            sample.greenMean,
+          const state = estimatorRef.current.pushRgb(
+            sample.r,
+            sample.g,
+            sample.b,
             now / 1000
           )
           setHr(state)
@@ -138,13 +151,27 @@ export default function Reader() {
     }
   }
 
-  const displayBpm = hr.valid
-    ? hr.stableBpm > 0
-      ? hr.stableBpm
-      : hr.bpm
-    : 0
-  const bpmText = hr.valid ? displayBpm.toFixed(0) : '--'
-  const acquiring = camera.state.status === 'running' && !hr.valid
+  // Swap BVP extractor. The two methods produce different signal shapes,
+  // so we wipe the running buffer and re-fill it under the new method.
+  const onChangeMethod = (next: BvpMethod) => {
+    setMethodState(next)
+    estimatorRef.current.setMethod(next)
+    setHr(INITIAL_HR_STATE)
+  }
+
+  // Show the stable BPM whenever it's readable — even during brief SNR
+  // dips. It only disappears after ~5 seconds without a valid sample.
+  const canShowNumber = hr.stableReadable || hr.valid
+  const displayBpm = hr.stableReadable
+    ? hr.stableBpm
+    : hr.valid
+      ? hr.bpm
+      : 0
+  const bpmText = canShowNumber ? displayBpm.toFixed(0) : '--'
+  const acquiring = camera.state.status === 'running' && !canShowNumber
+  // True when we're showing a held reading but the instantaneous window
+  // has dropped out — useful for a softer status note without flapping.
+  const holding = hr.stableReadable && !hr.valid
 
   const statusLine = (() => {
     if (landmarker.status === 'loading') return 'Loading face model…'
@@ -156,6 +183,8 @@ export default function Reader() {
     if (!faceDetected) return 'Looking for your face…'
     if (acquiring)
       return `Acquiring · SNR ${hr.snr.toFixed(1)} · buffer ${(hr.warmup * 100).toFixed(0)}%`
+    if (holding)
+      return `Holding reading · reacquiring (SNR ${hr.snr.toFixed(1)})`
     return `Instantaneous ${hr.bpm.toFixed(1)} · SNR ${hr.snr.toFixed(1)} · ${hr.fps.toFixed(1)} fps`
   })()
 
@@ -247,6 +276,27 @@ export default function Reader() {
                   ))}
                 </select>
               )}
+
+              {/* BVP method A/B toggle. POS (default) is the chrominance-based
+                  extractor from Wang 2017; GREEN is the pre-Apr-2026 baseline
+                  kept as an escape hatch. Swapping wipes the signal buffer. */}
+              <label className="inline-flex items-center gap-2 text-xs text-ink2">
+                Method:
+                <select
+                  value={method}
+                  onChange={(e) => onChangeMethod(e.target.value as BvpMethod)}
+                  className="rounded-full border border-ink/15 bg-white px-3 py-1 text-xs text-ink hover:border-ink/30 transition"
+                  title="Pure: POS / CHROM / GREEN. Hybrids average z-scored BVPs."
+                >
+                  <option value="POS">POS</option>
+                  <option value="CHROM">CHROM</option>
+                  <option value="GREEN">GREEN</option>
+                  <option value="POS+CHROM">POS + CHROM</option>
+                  <option value="POS+GREEN">POS + GREEN</option>
+                  <option value="CHROM+GREEN">CHROM + GREEN</option>
+                  <option value="POS+CHROM+GREEN">POS + CHROM + GREEN</option>
+                </select>
+              </label>
             </div>
           </div>
 
@@ -255,10 +305,10 @@ export default function Reader() {
             {/* BPM card */}
             <div className="rounded-2xl bg-white shadow-sm border border-ink/5 p-6 md:p-8 text-center">
               <div
-                className={`inline-flex items-baseline gap-3 ${hr.valid ? 'text-heart' : 'text-ink2/40'}`}
+                className={`inline-flex items-baseline gap-3 ${hr.valid ? 'text-heart' : holding ? 'text-heart/60' : 'text-ink2/40'}`}
               >
                 <HeartIcon
-                  bpm={hr.valid ? displayBpm : 0}
+                  bpm={canShowNumber ? displayBpm : 0}
                   size={32}
                   className="self-center"
                 />

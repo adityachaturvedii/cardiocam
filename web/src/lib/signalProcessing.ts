@@ -4,6 +4,143 @@ import FFT from 'fft.js'
 // process.py + signal_processing.py. Kept as pure functions — no state,
 // no React — so they're trivially unit-testable against synthetic signals.
 
+/**
+ * POS (plane-orthogonal-to-skin) BVP extractor — Wang, den Brinker, Stuijk,
+ * de Haan, "Algorithmic principles of remote PPG", IEEE TBME 2017. Replaces
+ * the naive green-channel-only signal with a chrominance-style projection
+ * that cancels specular reflections and lighting drift.
+ *
+ * Input: three channel-mean time series (R, G, B), same length, same fps.
+ * Output: a single BVP time series of the same length, ready for the
+ * existing detrend → Hamming → FFT pipeline.
+ *
+ * Implementation mirrors the pyVHR reference (MIT license). For a window
+ * of length w = round(1.6 * fps): temporal-normalize, project through
+ * P = [[0, 1, -1], [-2, 1, 1]], tune the two projected rows with an
+ * std-ratio alpha, overlap-add into H.
+ */
+export function posTransform(
+  r: Float64Array,
+  g: Float64Array,
+  b: Float64Array,
+  fps: number
+): Float64Array {
+  const T = r.length
+  if (g.length !== T || b.length !== T) {
+    throw new Error('posTransform: r, g, b must all be the same length')
+  }
+  const H = new Float64Array(T)
+  const w = Math.max(2, Math.round(1.6 * fps))
+  if (T < w) return H // not enough history yet — all zeros
+
+  const eps = 1e-9
+
+  for (let n = w - 1; n < T; n++) {
+    const m = n - w + 1
+
+    // Temporal mean over the window, per channel.
+    let mR = 0
+    let mG = 0
+    let mB = 0
+    for (let k = m; k <= n; k++) {
+      mR += r[k]
+      mG += g[k]
+      mB += b[k]
+    }
+    mR /= w
+    mG /= w
+    mB /= w
+    if (mR < eps || mG < eps || mB < eps) {
+      // Degenerate window (a fully black patch). Skip.
+      continue
+    }
+
+    // Normalize and project onto two axes: S1 = G/meanG - B/meanB,
+    // S2 = -2 R/meanR + G/meanG + B/meanB (Wang's P matrix applied to the
+    // temporally-normalized RGB window).
+    const S1 = new Float64Array(w)
+    const S2 = new Float64Array(w)
+    for (let i = 0; i < w; i++) {
+      const k = m + i
+      const rn = r[k] / mR
+      const gn = g[k] / mG
+      const bn = b[k] / mB
+      S1[i] = gn - bn
+      S2[i] = -2 * rn + gn + bn
+    }
+
+    // alpha = std(S1) / std(S2) — the "tuning" step.
+    const sd1 = stdZeroMean(S1)
+    const sd2 = stdZeroMean(S2)
+    const alpha = sd1 / (sd2 + eps)
+
+    // Hn = (S1 + alpha * S2) - mean — contribute to overlap-add.
+    let sumHn = 0
+    for (let i = 0; i < w; i++) sumHn += S1[i] + alpha * S2[i]
+    const mHn = sumHn / w
+
+    for (let i = 0; i < w; i++) {
+      H[m + i] += S1[i] + alpha * S2[i] - mHn
+    }
+  }
+
+  return H
+}
+
+/** Standard deviation assuming the series mean is already removed, matching
+ *  the pyVHR POS reference which std's the detrended projected rows. */
+function stdZeroMean(v: Float64Array): number {
+  let mean = 0
+  for (let i = 0; i < v.length; i++) mean += v[i]
+  mean /= v.length
+  let s = 0
+  for (let i = 0; i < v.length; i++) {
+    const d = v[i] - mean
+    s += d * d
+  }
+  return Math.sqrt(s / v.length)
+}
+
+/**
+ * CHROM BVP extractor — de Haan & Jeanne, "Robust pulse rate from
+ * chrominance-based rPPG", IEEE TBME 2013. Older than POS, simpler math:
+ * one pass over the full buffer, no sliding window.
+ *
+ *   Xcomp = 3*R - 2*G
+ *   Ycomp = 1.5*R + G - 1.5*B
+ *   alpha = std(Xcomp) / std(Ycomp)
+ *   BVP   = Xcomp - alpha * Ycomp
+ *
+ * Hardcoded RGB coefficients are calibrated for Caucasian skin in the
+ * original paper; CHROM generally trails POS slightly on diverse skin
+ * tones but in the Liu 2023 benchmark table it was within 0.5 BPM of
+ * POS on UBFC-rPPG and UBFC-Phys. Shipping both gives users an easy A/B.
+ */
+export function chromTransform(
+  r: Float64Array,
+  g: Float64Array,
+  b: Float64Array
+): Float64Array {
+  const T = r.length
+  if (g.length !== T || b.length !== T) {
+    throw new Error('chromTransform: r, g, b must all be the same length')
+  }
+  const Xcomp = new Float64Array(T)
+  const Ycomp = new Float64Array(T)
+  for (let i = 0; i < T; i++) {
+    Xcomp[i] = 3 * r[i] - 2 * g[i]
+    Ycomp[i] = 1.5 * r[i] + g[i] - 1.5 * b[i]
+  }
+  const sX = stdZeroMean(Xcomp)
+  const sY = stdZeroMean(Ycomp)
+  const alpha = sY > 1e-9 ? sX / sY : 0
+  const bvp = new Float64Array(T)
+  for (let i = 0; i < T; i++) {
+    bvp[i] = Xcomp[i] - alpha * Ycomp[i]
+  }
+  return bvp
+}
+
 /** Remove a best-fit linear trend from the data (scipy.signal.detrend default). */
 export function detrend(data: Float64Array): Float64Array {
   const n = data.length
@@ -53,7 +190,7 @@ export function l2Norm(v: Float64Array): number {
 }
 
 export interface BpmEstimate {
-  /** Peak-BPM candidate in the 50–180 band; always set. */
+  /** Peak-BPM candidate inside the configured band; always set. */
   bpm: number
   /** Peak power divided by in-band median power. */
   snr: number
@@ -68,16 +205,40 @@ export interface BpmEstimate {
 /**
  * Compute a BPM estimate from a single full-buffer run.
  *
- * Mirrors Python process.py line-for-line: detrend → Hamming window →
- * L2 normalize → FFT zero-padded to nFft → power spectrum → restrict
- * to 50–180 BPM → argmax. SNR = peak / median.
+ * Pipeline: detrend → Hamming window → L2 normalize → zero-padded FFT →
+ * power spectrum → restrict to [bpmMin, bpmMax] → argmax. SNR = peak /
+ * in-band median power.
+ *
+ * Optional arguments:
+ *   priorBpm      if set, restricts the argmax search to the window
+ *                 [priorBpm - maxDeltaBpm, priorBpm + maxDeltaBpm] ∩
+ *                 [bpmMin, bpmMax]. Useful once we have a stable prior:
+ *                 FFT noise can crown a spurious peak far from the true
+ *                 HR, and instantaneous HR can't change by tens of BPM
+ *                 between frames, so searching only a physiologically
+ *                 plausible window suppresses spurious jumps. SNR is
+ *                 still computed against the full-band median so the
+ *                 validity gate behaves the same.
+ *   maxDeltaBpm   half-width of the prior window. Default 20 BPM.
+ *   priorSigmaBpm if set along with priorBpm, applies a soft Gaussian
+ *                 bias to the peak-picking score inside the prior window:
+ *                 score[i] = fft[i] * exp(-0.5 * ((bpm[i] - prior) / sigma)^2).
+ *                 Disambiguates cases where two peaks are comparable in
+ *                 amplitude but only one is physiologically consistent
+ *                 with the recent rolling median (e.g. cardiac at 75 vs
+ *                 respiration harmonic at 90 in the same spectrum). The
+ *                 raw FFT returned for plotting is unaffected — only the
+ *                 selected BPM changes.
  */
 export function estimateBpm(
   buffer: Float64Array,
   times: Float64Array,
   nFft: number,
-  bpmMin = 50,
-  bpmMax = 180
+  bpmMin = 45,
+  bpmMax = 150,
+  priorBpm: number | null = null,
+  maxDeltaBpm = 20,
+  priorSigmaBpm: number | null = null
 ): BpmEstimate {
   const L = buffer.length
   // L samples captured in times[L-1] - times[0] seconds span L-1 intervals,
@@ -138,17 +299,57 @@ export function estimateBpm(
     bandFreqs[i] = (loIdx + i) * binBpm
   }
 
-  let peakIdx = 0
-  let peakVal = 0
-  for (let i = 0; i < bandLen; i++) {
-    if (bandFft[i] > peakVal) {
-      peakVal = bandFft[i]
+  // Determine the argmax search window. Without a prior it's the whole
+  // band; with one, a narrower [prior - maxDelta, prior + maxDelta] ∩ band.
+  let searchLo = 0
+  let searchHi = bandLen - 1
+  if (priorBpm !== null && bandLen > 0) {
+    const lo = priorBpm - maxDeltaBpm
+    const hi = priorBpm + maxDeltaBpm
+    // bandFreqs is monotonically increasing — binary-search-lite by linear
+    // probing since the array is ≤ ~100 elements in the FFT sizes we use.
+    let newLo = -1
+    let newHi = -1
+    for (let i = 0; i < bandLen; i++) {
+      if (bandFreqs[i] >= lo && newLo < 0) newLo = i
+      if (bandFreqs[i] <= hi) newHi = i
+    }
+    // If the prior window has no overlap with the band, fall back to the
+    // whole band rather than returning 0 — happens at cold start when
+    // priorBpm is stale or if the prior wandered way outside the band.
+    if (newLo >= 0 && newHi >= newLo) {
+      searchLo = newLo
+      searchHi = newHi
+    }
+  }
+
+  // Argmax. Without a prior-bias sigma, we use the raw spectrum directly.
+  // With one, we weight by a Gaussian centered at priorBpm so a slightly
+  // weaker peak near the prior wins over a slightly stronger peak far
+  // from it — but only when the weighted difference is actually smaller.
+  let peakIdx = searchLo
+  let peakScore = -Infinity
+  const useBias = priorBpm !== null && priorSigmaBpm !== null && priorSigmaBpm > 0
+  const sigma = priorSigmaBpm ?? 1
+  const sigma2 = 2 * sigma * sigma
+  for (let i = searchLo; i <= searchHi; i++) {
+    let score = bandFft[i]
+    if (useBias) {
+      const d = bandFreqs[i] - (priorBpm as number)
+      score *= Math.exp(-(d * d) / sigma2)
+    }
+    if (score > peakScore) {
+      peakScore = score
       peakIdx = i
     }
   }
   const bpm = bandLen > 0 ? bandFreqs[peakIdx] : 0
+  // SNR uses the RAW peak power at the chosen bin (not the biased score),
+  // so the validity gate reflects genuine spectral strength and is
+  // unaffected by the bias weighting.
+  const peakVal = bandLen > 0 ? bandFft[peakIdx] : 0
   const median = bandLen > 0 ? medianOf(bandFft) : 0
-  const snr = median > 0 ? peakVal / median : 0
+  const snr = median > 0 && peakVal > 0 ? peakVal / median : 0
 
   return { bpm, snr, fft: bandFft, freqsBpm: bandFreqs, fps }
 }

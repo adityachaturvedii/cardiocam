@@ -1,22 +1,20 @@
-// Extract the mean green-channel intensity from two cheek patches.
+// Extract the mean R, G, B intensities from two cheek patches.
 //
-// Unlike the Python desktop app, we don't rotate-and-crop the face first.
-// The signal is a scalar (mean green over ROI skin pixels) and is
-// rotation-invariant — cropping an axis-aligned rectangle straight from
-// the source frame gives a slightly different but equally valid skin
-// patch. The aligned-face step in Python was architectural, not
-// accuracy-critical.
+// The signal is the three color-channel means over ROI skin pixels, which is
+// rotation-invariant — cropping an axis-aligned rectangle straight from the
+// source frame gives a skin patch that the downstream BVP methods (GREEN,
+// POS, CHROM) can all consume identically.
 //
-// We use polygon fills over MediaPipe Face Mesh cheek landmarks instead
-// of bounding rectangles to avoid catching non-skin pixels (eyebrows,
-// lip edge) at extreme head angles.
+// We use polygon fills over MediaPipe Face Mesh cheek landmarks rather than
+// bounding rectangles to avoid catching non-skin pixels (eyebrows, lip edge)
+// at extreme head angles.
 
 import type { NormalizedLandmark } from '@mediapipe/tasks-vision'
 
 // Cheek-apex polygons on the MediaPipe 478-point Face Mesh. These bound the
 // zygomatic region — high, well clear of the nasolabial fold, the lips, and
-// the nose — so the green-channel mean samples clean cheek skin with no
-// hair or lip edge contamination.
+// the nose — so the channel means sample clean cheek skin with no hair or
+// lip edge contamination.
 //
 // Subject-left cheek (viewer's-right side of the image).
 const LEFT_CHEEK_RING = [345, 352, 411, 425, 266, 371, 355]
@@ -24,6 +22,13 @@ const LEFT_CHEEK_RING = [345, 352, 411, 425, 266, 371, 355]
 const RIGHT_CHEEK_RING = [116, 123, 187, 205, 36, 142, 126]
 
 export interface CheekSample {
+  /** Mean red channel over both cheek polygons, 0-255. */
+  r: number
+  /** Mean green channel over both cheek polygons, 0-255. */
+  g: number
+  /** Mean blue channel over both cheek polygons, 0-255. */
+  b: number
+  /** Alias for g — keeps the old green-only pipeline trivially backwards compatible. */
   greenMean: number
   leftArea: number
   rightArea: number
@@ -31,16 +36,15 @@ export interface CheekSample {
 
 /**
  * Sample the two cheek ROIs from the current video frame and return the
- * mean green-channel intensity. Returns null if either ROI ends up with
- * no pixels (face partly off-frame).
+ * per-channel means. Returns null if either ROI ends up with no pixels
+ * (face partly off-frame).
  */
-export function sampleCheekGreen(
+export function sampleCheekRgb(
   landmarks: NormalizedLandmark[],
   ctx: CanvasRenderingContext2D,
   frameWidth: number,
   frameHeight: number
 ): CheekSample | null {
-  // Pull out the two polygons in pixel coordinates.
   const leftPoly = LEFT_CHEEK_RING.map((i) => ({
     x: landmarks[i].x * frameWidth,
     y: landmarks[i].y * frameHeight,
@@ -50,24 +54,34 @@ export function sampleCheekGreen(
     y: landmarks[i].y * frameHeight,
   }))
 
-  const left = meanGreenInPolygon(ctx, leftPoly, frameWidth, frameHeight)
-  const right = meanGreenInPolygon(ctx, rightPoly, frameWidth, frameHeight)
+  const left = meanRgbInPolygon(ctx, leftPoly, frameWidth, frameHeight)
+  const right = meanRgbInPolygon(ctx, rightPoly, frameWidth, frameHeight)
   if (left === null || right === null) return null
 
+  // Equal-weight average across both cheeks.
+  const r = (left.r + right.r) / 2
+  const g = (left.g + right.g) / 2
+  const b = (left.b + right.b) / 2
+
   return {
-    greenMean: (left.mean + right.mean) / 2,
+    r,
+    g,
+    b,
+    greenMean: g,
     leftArea: left.area,
     rightArea: right.area,
   }
 }
 
-function meanGreenInPolygon(
+/** Old name kept as a thin alias for any external callers. */
+export const sampleCheekGreen = sampleCheekRgb
+
+function meanRgbInPolygon(
   ctx: CanvasRenderingContext2D,
   poly: { x: number; y: number }[],
   frameWidth: number,
   frameHeight: number
-): { mean: number; area: number } | null {
-  // Compute AABB of the polygon, clamped to frame bounds.
+): { r: number; g: number; b: number; area: number } | null {
   let minX = Infinity,
     maxX = -Infinity,
     minY = Infinity,
@@ -86,9 +100,6 @@ function meanGreenInPolygon(
   const h = maxY - minY + 1
   if (w <= 0 || h <= 0) return null
 
-  // getImageData for just this region, then ray-cast each pixel against
-  // the polygon to decide inclusion. 478-point landmarks give us polygons
-  // ~20-40px across, so the pixel count is bounded and this runs in <1ms.
   let imageData: ImageData
   try {
     imageData = ctx.getImageData(minX, minY, w, h)
@@ -97,7 +108,9 @@ function meanGreenInPolygon(
   }
   const buf = imageData.data
 
-  let greenSum = 0
+  let rSum = 0
+  let gSum = 0
+  let bSum = 0
   let count = 0
   for (let py = 0; py < h; py++) {
     const worldY = minY + py + 0.5
@@ -105,13 +118,15 @@ function meanGreenInPolygon(
       const worldX = minX + px + 0.5
       if (pointInPolygon(worldX, worldY, poly)) {
         const i = (py * w + px) * 4
-        greenSum += buf[i + 1]
+        rSum += buf[i]
+        gSum += buf[i + 1]
+        bSum += buf[i + 2]
         count++
       }
     }
   }
   if (count === 0) return null
-  return { mean: greenSum / count, area: count }
+  return { r: rSum / count, g: gSum / count, b: bSum / count, area: count }
 }
 
 function pointInPolygon(
