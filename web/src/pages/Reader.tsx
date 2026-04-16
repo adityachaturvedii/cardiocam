@@ -218,12 +218,12 @@ export default function Reader() {
                 Let the video element's intrinsic size drive the container
                 height; the overlay canvas is absolute-positioned on top so
                 its coordinates always match the rendered video. */}
-            <div className="relative w-full rounded-2xl overflow-hidden bg-black shadow-lg">
+            <div className="relative w-full rounded-2xl overflow-hidden bg-black shadow-lg max-h-[40vh] lg:max-h-none">
               <video
                 ref={camera.videoRef}
                 playsInline
                 muted
-                className="block w-full h-auto scale-x-[-1]"
+                className="block w-full h-full object-contain scale-x-[-1]"
               />
               <canvas
                 ref={overlayCanvasRef}
