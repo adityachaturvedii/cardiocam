@@ -218,16 +218,21 @@ export default function Reader() {
                 Let the video element's intrinsic size drive the container
                 height; the overlay canvas is absolute-positioned on top so
                 its coordinates always match the rendered video. */}
-            <div className="relative w-full rounded-2xl overflow-hidden bg-black shadow-lg max-h-[40vh] lg:max-h-none">
+            {/* Mobile: 4:3 box capped at 40vh so the BPM card is visible
+                without scrolling. object-cover center-crops the feed to
+                fill the box — the face stays centered (MediaPipe landmarks
+                are in source coords, and the overlay canvas matches via
+                the same object-cover + aspect). Desktop: uncapped. */}
+            <div className="relative w-full rounded-2xl overflow-hidden bg-black shadow-lg aspect-[4/3] max-h-[40vh] lg:max-h-none lg:aspect-video">
               <video
                 ref={camera.videoRef}
                 playsInline
                 muted
-                className="block w-full h-full object-contain scale-x-[-1]"
+                className="absolute inset-0 w-full h-full object-cover scale-x-[-1]"
               />
               <canvas
                 ref={overlayCanvasRef}
-                className="absolute inset-0 w-full h-full scale-x-[-1] pointer-events-none"
+                className="absolute inset-0 w-full h-full object-cover scale-x-[-1] pointer-events-none"
               />
               <canvas ref={samplingCanvasRef} className="hidden" />
               {!isRunning && (
