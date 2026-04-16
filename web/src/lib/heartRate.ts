@@ -590,7 +590,7 @@ function computeBvp(
   let pos: Float64Array | null = null
   let chrom: Float64Array | null = null
   const getPos = () => pos ?? (pos = posTransform(r, g, b, fps))
-  const getChrom = () => chrom ?? (chrom = chromTransform(r, g, b))
+  const getChrom = () => chrom ?? (chrom = chromTransform(r, g, b, fps))
 
   switch (method) {
     case 'POS':
