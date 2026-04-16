@@ -32,6 +32,17 @@ const RIGHT_CHEEK_RING = [116, 123, 187, 205, 36, 142, 126]
 // us verify this empirically per user.
 const FOREHEAD_RING = [107, 66, 69, 151, 299, 296, 336, 9]
 
+/** Per-ROI RGB triple (mean channel intensities over the polygon skin
+ *  pixels, 0-255). */
+export interface RgbMean {
+  r: number
+  g: number
+  b: number
+  /** Number of pixels contributing to the means. 0 if the polygon fell
+   *  off the frame. */
+  area: number
+}
+
 export interface CheekSample {
   /** Equal-weighted mean red across all available ROIs, 0-255. */
   r: number
@@ -46,6 +57,10 @@ export interface CheekSample {
   /** Number of pixels that contributed to the forehead mean. 0 if the
    *  forehead polygon fell outside the frame or degenerated to zero area. */
   foreheadArea: number
+  /** Per-region means. Forehead is null when its polygon was empty. */
+  left: RgbMean
+  right: RgbMean
+  forehead: RgbMean | null
 }
 
 /**
@@ -101,6 +116,9 @@ export function sampleCheekRgb(
     leftArea: left.area,
     rightArea: right.area,
     foreheadArea: forehead?.area ?? 0,
+    left,
+    right,
+    forehead,
   }
 }
 

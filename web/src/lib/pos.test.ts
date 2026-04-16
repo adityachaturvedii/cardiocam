@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest'
-import { chromTransform, estimateBpm, posTransform } from './signalProcessing'
+import {
+  chromTransform,
+  estimateBpm,
+  omitTransform,
+  posTransform,
+} from './signalProcessing'
 
 /**
  * Synthesize a color-skin time series with a heart-rate modulation. The key
@@ -136,6 +141,60 @@ describe('chromTransform', () => {
   it('throws when channel lengths disagree', () => {
     expect(() =>
       chromTransform(new Float64Array(5), new Float64Array(4), new Float64Array(5))
+    ).toThrow()
+  })
+})
+
+describe('omitTransform', () => {
+  const fps = 30
+  const L = 200
+
+  function synth(bpm: number) {
+    const r = new Float64Array(L)
+    const g = new Float64Array(L)
+    const b = new Float64Array(L)
+    const ts = new Float64Array(L)
+    const hz = bpm / 60
+    const rBase = 180
+    const gBase = 130
+    const bBase = 110
+    const dR = 0.33
+    const dG = 0.77
+    const dB = 0.53
+    for (let i = 0; i < L; i++) {
+      ts[i] = i / fps
+      const pulse = 0.01 * Math.sin(2 * Math.PI * hz * ts[i])
+      r[i] = rBase * (1 + dR * pulse)
+      g[i] = gBase * (1 + dG * pulse)
+      b[i] = bBase * (1 + dB * pulse)
+    }
+    return { r, g, b, ts }
+  }
+
+  it('recovers a synthetic 72 BPM within one bin', () => {
+    const { r, g, b, ts } = synth(72)
+    const bvp = omitTransform(r, g, b)
+    const est = estimateBpm(bvp, ts, 1024)
+    expect(est.bpm).toBeGreaterThan(70)
+    expect(est.bpm).toBeLessThan(74)
+  })
+
+  it('handles empty input gracefully', () => {
+    const bvp = omitTransform(
+      new Float64Array(0),
+      new Float64Array(0),
+      new Float64Array(0)
+    )
+    expect(bvp.length).toBe(0)
+  })
+
+  it('throws when channel lengths disagree', () => {
+    expect(() =>
+      omitTransform(
+        new Float64Array(5),
+        new Float64Array(4),
+        new Float64Array(5)
+      )
     ).toThrow()
   })
 })

@@ -102,6 +102,63 @@ function stdZeroMean(v: Float64Array): number {
 }
 
 /**
+ * OMIT (Orthogonal Matrix Image Transformation) BVP extractor —
+ * Álvarez Casado & Bordallo López, "Face2PPG: An unsupervised pipeline
+ * for blood volume pulse extraction from faces", arXiv:2202.04101 (2022).
+ *
+ * Algorithm, verbatim from the pyVHR reference (MIT license):
+ *   Q, R = qr(X)              where X is the 3×T RGB sample matrix
+ *   S    = Q[:, 0]            first column of Q — unit vector along
+ *                             the dominant color direction
+ *   P    = I - S Sᵀ            projector orthogonal to S
+ *   Y    = P · X              project each frame out of the S direction
+ *   BVP  = Y[1, :]             second row (green-like post-projection)
+ *
+ * Geometric note: for a 3×T matrix X (T ≫ 3) np.linalg.qr in reduced
+ * mode gives Q ∈ ℝ^{3×3} and R ∈ ℝ^{3×T}. The first column of Q is
+ * simply X[:, 0] normalized to unit length (with an optional sign
+ * flip) — a direct consequence of X = Q·R with R upper-triangular.
+ * We reproduce that specific behavior rather than a full orthonormal
+ * basis of the column space, because matching the reference is the
+ * point (the published benchmark numbers assume this form).
+ *
+ * Robust-to-compression claim (from the paper): the QR projection
+ * handles small RGB quantization errors more gracefully than POS's
+ * fixed projection matrix, particularly for H.264-compressed mobile
+ * video streams.
+ */
+export function omitTransform(
+  r: Float64Array,
+  g: Float64Array,
+  b: Float64Array
+): Float64Array {
+  const T = r.length
+  if (g.length !== T || b.length !== T) {
+    throw new Error('omitTransform: r, g, b must all be the same length')
+  }
+  if (T === 0) return new Float64Array(0)
+
+  // S = normalized first column of X = [r[0], g[0], b[0]] / ‖·‖.
+  const r0 = r[0]
+  const g0 = g[0]
+  const b0 = b[0]
+  const norm = Math.sqrt(r0 * r0 + g0 * g0 + b0 * b0)
+  if (norm < 1e-9) return new Float64Array(T)
+  const s0 = r0 / norm
+  const s1 = g0 / norm
+  const s2 = b0 / norm
+
+  // Y = (I - S Sᵀ) X, extract row 1 (green-like).
+  // Per-frame projection: y_i = X_i - (S · X_i) * S, we want y_i[1].
+  const out = new Float64Array(T)
+  for (let i = 0; i < T; i++) {
+    const dot = s0 * r[i] + s1 * g[i] + s2 * b[i]
+    out[i] = g[i] - dot * s1
+  }
+  return out
+}
+
+/**
  * CHROM BVP extractor — de Haan & Jeanne, "Robust pulse rate from
  * chrominance-based rPPG", IEEE TBME 2013. Older than POS, simpler math:
  * one pass over the full buffer, no sliding window.
