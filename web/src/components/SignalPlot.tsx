@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react'
 
 interface Props {
-  /** Detrended green-channel buffer (most recent 100 samples). */
+  /** BVP buffer to plot (most recent few seconds of samples). */
   signal: Float64Array
   /** How tall the plot should be in CSS pixels. */
   height?: number

@@ -8,6 +8,7 @@ import {
   type HeartRateState,
 } from '../lib/heartRate'
 import {
+  FOREHEAD_RING,
   LEFT_CHEEK_RING,
   RIGHT_CHEEK_RING,
   sampleCheekRgb,
@@ -84,6 +85,7 @@ export default function Reader() {
         const lm = faces[0]
         drawPolygon(overlayCtx, LEFT_CHEEK_RING, lm, vw, vh)
         drawPolygon(overlayCtx, RIGHT_CHEEK_RING, lm, vw, vh)
+        drawPolygon(overlayCtx, FOREHEAD_RING, lm, vw, vh)
 
         const sample = sampleCheekRgb(lm, samplingCtx, vw, vh)
         if (sample) {

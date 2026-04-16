@@ -29,13 +29,15 @@ available) and a small TypeScript DSP core.
      and simpler, still competitive on stable scenes.
    - **GREEN** (Verkruysse et al., 2008) — green-channel mean. Baseline.
    - Plus four hybrid modes that z-score and average the pure methods.
-3. **BPM estimation** — detrend → Hamming window → zero-padded FFT (1024
-   bins over ~3.3 s) → argmax inside the 45–150 BPM band.
-4. **Stability** — once enough valid samples have accumulated, the peak
-   search is clamped to `±20 BPM` of the rolling median and softly
-   biased toward it. An SNR gate with hysteresis (enter at 4, exit at
-   2.5, with a ~1 s debounce) decides when to trust the reading, and a
-   rolling median of recent valid BPMs is displayed.
+3. **BPM estimation** — detrend → Hamming window → zero-padded FFT (2048
+   bins over ~8 s) → argmax inside the 45–150 BPM band.
+4. **Stability** — the power spectrum is exponentially accumulated across
+   frames (half-life ~8 s) so the persistent cardiac peak stands out
+   from transient noise. The peak search is clamped to `±20 BPM` of the
+   rolling median and softly biased toward it. An SNR gate with
+   hysteresis (enter at 4, exit at 2.5, ~1 s debounce) decides when to
+   trust the reading; the displayed BPM is an EWMA of the robust median
+   of recent valid estimates.
 
 ## Running the web app locally
 

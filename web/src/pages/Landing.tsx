@@ -52,7 +52,7 @@ export default function Landing() {
             <Card
               step="3"
               title="Find the peak"
-              body="Detrend, window, FFT the last 100 samples. The biggest peak between 50–180 BPM is your heart rate."
+              body="Detrend, window, FFT the last few seconds. The biggest peak between 45–150 BPM is your heart rate — smoothed over time for stability."
             />
           </div>
         </section>

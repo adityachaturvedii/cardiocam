@@ -1,4 +1,9 @@
-import { chromTransform, estimateBpm, posTransform } from './signalProcessing'
+import {
+  chromTransform,
+  estimateBpm,
+  pickPeak,
+  posTransform,
+} from './signalProcessing'
 
 export type BvpMethod =
   | 'GREEN'
@@ -18,7 +23,7 @@ export interface HeartRateState {
   valid: boolean
   /** Current estimated capture sample rate in Hz. */
   fps: number
-  /** 0-1 progress while the initial 100-sample buffer is filling. */
+  /** 0-1 progress while the initial sample buffer is filling. */
   warmup: number
   /** Most recent BVP waveform (post-transform, detrended), for plotting. */
   signal: Float64Array
@@ -39,8 +44,14 @@ export interface HeartRateState {
 }
 
 export class HeartRateEstimator {
-  private readonly bufferSize = 100
-  private readonly nFft = 1024
+  // 8 seconds at 30 FPS. Longer than the original 100 (3.3s) on purpose:
+  // FFT bin width is fps / nFft in Hz; the effective spectral resolution
+  // that actually matters is bounded by the buffer length (inverse of
+  // duration). 240 samples gives ~0.92 BPM bins vs the old 2.2 BPM
+  // bins. Cost: 2× slower to re-acquire after signal loss, and the
+  // displayed waveform wiggles more because we're drawing more history.
+  private readonly bufferSize = 240
+  private readonly nFft = 2048
   // Hysteresis thresholds. Enter valid when SNR rises above snrEnter;
   // exit only when it drops below snrExit for several consecutive frames.
   // The gap between enter/exit prevents flapping when the SNR hovers
@@ -69,6 +80,18 @@ export class HeartRateEstimator {
   // stable median as an anchor. Before this many, the rate limiter does
   // nothing.
   private readonly minValidForAnchor = 8
+  // Exponentially-weighted accumulated power spectrum. Each full-buffer
+  // FFT contributes with decaying weight, so the spectrum converges on
+  // the persistent peaks (your cardiac fundamental) while rejecting
+  // single-frame noise bursts. Half-life equal to the buffer duration
+  // (~8s) means the spectrum stays responsive to real HR changes.
+  private readonly spectrumHalfLifeFrames = 240
+  private accumSpectrum: Float64Array | null = null
+  // EWMA smoothing on the emitted stableBpm. Half-life independent of
+  // the spectrum accumulator — we want the displayed number to settle
+  // faster than the spectrum so the user sees responsiveness.
+  private readonly bpmEwmaHalfLifeFrames = 90 // 3s at 30 fps
+  private ewmaBpm: number | null = null
 
   // Rolling RGB buffers (channel means over the cheek ROIs) and their
   // wall-clock timestamps in seconds.
@@ -124,6 +147,8 @@ export class HeartRateEstimator {
     this.lastValid = false
     this.framesBelowExit = 0
     this.framesSinceValid = Infinity
+    this.accumSpectrum = null
+    this.ewmaBpm = null
     this.state = this.makeInitialState()
   }
 
@@ -143,7 +168,7 @@ export class HeartRateEstimator {
     // replaced with the last accepted sample so the buffer doesn't get
     // poisoned by e.g. a finger brushing the ROI.
     const L = this.gBuf.length
-    if (L > 99) {
+    if (L >= this.bufferSize) {
       let mean = 0
       for (let i = 0; i < L; i++) mean += this.gBuf[i]
       mean /= L
@@ -199,24 +224,51 @@ export class HeartRateEstimator {
     // the sum, which would make e.g. POS+GREEN effectively just GREEN.
     const bvp = computeBvp(this.method, rArr, gArr, bArr, fps)
 
-    // If we have enough history for a stable anchor, pass it as the prior
-    // so the FFT peak search is restricted to a physiologically plausible
-    // ±20 BPM window around it (hard cap) AND softly Gaussian-biased
-    // toward the prior inside that window (tie-break between close peaks).
-    // This kills both the big noise-jumps (50s → 170s) and the smaller
-    // wander from argmax toggling between two near-equal peaks.
-    // Cold-start (no anchor yet): let the search roam the full band.
+    // Run the FFT on the current buffer but don't yet pick a peak — we'll
+    // combine this instantaneous spectrum with an exponentially-decayed
+    // historical spectrum and pick from the accumulator. Passing no prior
+    // here means estimateBpm returns the full in-band spectrum unbiased.
+    const inst = estimateBpm(bvp, ts, this.nFft)
+
+    // Update the running accumulated spectrum. Initialize on first call
+    // (or after a reset / method change / band length change). Decay
+    // weight: alpha_new = 1 - exp(-ln(2) / halfLife), so after halfLife
+    // frames a sample's weight is 0.5.
+    if (
+      this.accumSpectrum === null ||
+      this.accumSpectrum.length !== inst.fft.length
+    ) {
+      this.accumSpectrum = new Float64Array(inst.fft)
+    } else {
+      const alpha = 1 - Math.exp(-Math.LN2 / this.spectrumHalfLifeFrames)
+      for (let i = 0; i < this.accumSpectrum.length; i++) {
+        this.accumSpectrum[i] =
+          (1 - alpha) * this.accumSpectrum[i] + alpha * inst.fft[i]
+      }
+    }
+
+    // Pick the peak from the ACCUMULATED spectrum — the signal we actually
+    // care about (cardiac fundamental) is persistent across frames while
+    // noise is transient, so integrating over time amplifies it relative
+    // to noise.
     const anchor = this.currentAnchor()
-    const est = estimateBpm(
-      bvp,
-      ts,
-      this.nFft,
-      undefined,
-      undefined,
+    const pick = pickPeak(
+      this.accumSpectrum,
+      inst.freqsBpm,
       anchor,
       this.maxDeltaBpm,
       anchor !== null ? this.priorSigmaBpm : null
     )
+
+    // Emit the accumulated spectrum for plotting/validation so the user
+    // sees the decision surface, not just the noisy instantaneous one.
+    const est = {
+      bpm: pick.bpm,
+      snr: pick.snr,
+      fft: this.accumSpectrum,
+      freqsBpm: inst.freqsBpm,
+      fps: inst.fps,
+    }
 
     this.framesSinceFull++
     const pastWarmup = this.framesSinceFull >= this.warmupFrames
@@ -263,11 +315,24 @@ export class HeartRateEstimator {
     }
     this.lastValid = valid
 
-    let stable = 0
+    // Raw stable: median of the recent valid BPMs (robust to single
+    // outliers). Then smooth with an EWMA so moment-to-moment wobble
+    // settles even more. EWMA runs only on frames where we produced a
+    // valid reading — invalid frames don't decay the estimate.
+    let stableRaw = 0
     if (this.validBpms.length >= 25) {
       const sorted = [...this.validBpms].sort((a, b) => a - b)
-      stable = sorted[Math.floor(sorted.length / 2)]
+      stableRaw = sorted[Math.floor(sorted.length / 2)]
     }
+    if (valid && stableRaw > 0) {
+      if (this.ewmaBpm === null) {
+        this.ewmaBpm = stableRaw
+      } else {
+        const alpha = 1 - Math.exp(-Math.LN2 / this.bpmEwmaHalfLifeFrames)
+        this.ewmaBpm = (1 - alpha) * this.ewmaBpm + alpha * stableRaw
+      }
+    }
+    const stable = this.ewmaBpm ?? stableRaw
 
     // The stable BPM is readable whenever we have a recent-enough stream
     // of valid samples — it survives momentary SNR dips so the UI
