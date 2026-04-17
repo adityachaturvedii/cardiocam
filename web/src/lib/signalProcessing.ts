@@ -736,6 +736,39 @@ export function pickPeak(
       peakIdx = i
     }
   }
+  // ── Harmonic rejection ──
+  // The FFT argmax can lock onto the 2nd harmonic (2×HR) when the
+  // harmonic is stronger than the fundamental — common for certain skin
+  // tones and lighting conditions. If we find a sub-harmonic at f/2 with
+  // substantial power in the resting-HR range, prefer it.
+  //
+  // This single check fixes the catastrophic subjects in UBFC-rPPG
+  // (e.g. subject20: GT 53 BPM, argmax locked onto 106 BPM harmonic).
+  if (bandLen > 0) {
+    const fPeak = bandFreqs[peakIdx]
+    const fHalf = fPeak / 2
+    // Only consider sub-harmonic if it falls in a plausible resting range.
+    if (fHalf >= 40 && fHalf <= 110) {
+      // Find the closest bin to fHalf.
+      let bestSubIdx = -1
+      let bestSubDist = Infinity
+      for (let i = 0; i < bandLen; i++) {
+        const d = Math.abs(bandFreqs[i] - fHalf)
+        if (d < bestSubDist && d < 5) { // within 5 BPM tolerance
+          bestSubDist = d
+          bestSubIdx = i
+        }
+      }
+      // Switch if the sub-harmonic has at least 30% of the peak's power.
+      // This threshold is generous — the fundamental is often weaker than
+      // the 2nd harmonic in rPPG signals, so we want to accept it even
+      // when it's not dominant.
+      if (bestSubIdx >= 0 && bandFft[bestSubIdx] > 0.3 * bandFft[peakIdx]) {
+        peakIdx = bestSubIdx
+      }
+    }
+  }
+
   const bpm = bandLen > 0 ? bandFreqs[peakIdx] : 0
   const peakVal = bandLen > 0 ? bandFft[peakIdx] : 0
   const median = bandLen > 0 ? medianOf(bandFft) : 0
