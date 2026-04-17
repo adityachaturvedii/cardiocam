@@ -39,4 +39,5 @@ var/
 
 # Benchmark data — derived from UBFC-rPPG dataset, too large + licensed
 benchmark/data/ubfc_rgb/
+benchmark/data/ubfc_ds1_rgb/
 benchmark/data/ubfc_results.csv

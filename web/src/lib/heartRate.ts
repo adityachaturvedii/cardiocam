@@ -535,7 +535,7 @@ export class HeartRateEstimator {
 
     // ── SpO2 (experimental) ──
     // Uses the red and blue channel buffers directly (not the BVP).
-    const spo2Est = estimateSpO2(rArr, bArr, ts, this.recentSpO2)
+    const spo2Est = estimateSpO2(rArr, gArr, bArr, ts, this.recentSpO2)
     if (spo2Est.valid && spo2Est.spo2 > 0) {
       this.recentSpO2.push(spo2Est.spo2)
       if (this.recentSpO2.length > 60) this.recentSpO2.shift()
