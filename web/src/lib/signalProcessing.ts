@@ -911,21 +911,14 @@ export function estimateRR(
 // ──────────────────────────────────────────────────────────────────────
 
 export interface SpO2Estimate {
-  /** Estimated SpO2 percentage (from combined angle + eigenvalue features). 0 if invalid. */
+  /** Estimated SpO2 percentage. 0 if invalid. */
   spo2: number
-  /** The pulse vector angle (degrees) vs the HbO2 reference. */
+  /** The pulse vector angle (degrees) used for SpO2 mapping. */
   angle: number
-  /** Ratio of dominant eigenvalue to total variance (0-1). Higher = cleaner
-   *  pulse direction. Lower SpO2 tends to produce a less directional pulse
-   *  (eigenvalue ratio drops). */
-  eigenvalueRatio: number
   /** Trend direction: 'stable' | 'rising' | 'falling'. */
   trend: 'stable' | 'rising' | 'falling'
   /** True when the estimate is likely trustworthy. */
   valid: boolean
-  /** Raw measurement confidence 0-1 (eigenvalue ratio × AC strength).
-   *  Used by the caller for Bayesian weighting. */
-  confidence: number
 }
 
 /**
@@ -966,7 +959,7 @@ export function estimateSpO2(
   recentSpO2: number[]
 ): SpO2Estimate {
   const L = rBuf.length
-  const INVALID: SpO2Estimate = { spo2: 0, angle: 0, eigenvalueRatio: 0, trend: 'stable', valid: false, confidence: 0 }
+  const INVALID: SpO2Estimate = { spo2: 0, angle: 0, trend: 'stable', valid: false }
   if (L < 60) return INVALID
 
   const duration = times[L - 1] - times[0]
@@ -1027,39 +1020,26 @@ export function estimateSpO2(
   const cosAngle = Math.max(-1, Math.min(1, dot / refNorm))
   const angle = Math.acos(cosAngle) * (180 / Math.PI)
 
-  // ── Feature #4: Eigenvalue ratio ──
-  // The ratio of the dominant eigenvalue to the total variance measures
-  // how "one-directional" the pulse signal is. Pure oxygenated blood
-  // produces a very directional pulse (ratio ~0.95); mixed or noisy
-  // signals are less directional (ratio ~0.5-0.8). This serves as both
-  // a validity check and a secondary SpO2 feature.
+  // Empirical calibration: angle → SpO2.
+  // At SpO2=100%, the vectors are aligned, angle ≈ 0.
+  // As SpO2 drops, angle increases.
+  // The mapping is approximately linear in the 90-100% SpO2 range:
+  //   SpO2 ≈ 100 - K * angle
+  // K is camera-dependent. We'll calibrate against DATASET_1 by
+  // measuring the angle range across GT SpO2 95-99%.
+  // For now, use a reasonable default: angles typically range 0-30°
+  // for SpO2 95-100%. So K ≈ 5/30 ≈ 0.17.
+  // More aggressive: K = 0.25 (maps 0-20° to 100-95%).
+  let spo2 = 100 - 0.25 * angle
+  spo2 = Math.max(70, Math.min(100, spo2))
+
+  // Validity: the dominant eigenvalue should explain a significant
+  // portion of the total variance. Check that the pulse vector is
+  // not degenerate.
   const eigenval = cov[0] * v[0] * v[0] + cov[4] * v[1] * v[1] + cov[8] * v[2] * v[2]
     + 2 * (cov[1] * v[0] * v[1] + cov[2] * v[0] * v[2] + cov[5] * v[1] * v[2])
   const totalVar = cov[0] + cov[4] + cov[8]
-  const eigenvalueRatio = totalVar > 1e-12 ? eigenval / totalVar : 0
-
-  // Validity: need a reasonably directional pulse vector.
-  const valid = eigenvalueRatio > 0.3
-
-  // ── Combined SpO2 estimate from angle + eigenvalue ratio ──
-  // Two features, both weakly correlated with SpO2:
-  //   - angle: higher = lower SpO2 (pulse vector deviates from HbO2 ref)
-  //   - eigenvalueRatio: lower = lower SpO2 (less directional pulse)
-  // Combine them as a weighted sum. The eigenvalue ratio contribution
-  // is scaled so that ratio=0.95 → +0 BPM correction, ratio=0.70 → −3%
-  // SpO2 correction. This adds inter-subject variation that the angle
-  // alone can't capture.
-  const angleContrib = 100 - 0.25 * angle
-  const eigenContrib = 12 * (eigenvalueRatio - 0.85) // ~0 at 0.85, -1.8 at 0.70, +1.2 at 0.95
-  let spo2 = angleContrib + eigenContrib
-  spo2 = Math.max(70, Math.min(100, spo2))
-
-  // Confidence: combines eigenvalue ratio (directional quality) with
-  // overall AC amplitude (signal presence). Used by the caller for
-  // Bayesian weighting against the population prior.
-  const meanAcPower = (cov[0] + cov[4] + cov[8]) // trace = sum of variances
-  const acStrength = Math.min(1, meanAcPower * 1e4) // normalize to ~0-1
-  const confidence = Math.min(1, eigenvalueRatio * acStrength)
+  const valid = totalVar > 1e-12 && (eigenval / totalVar) > 0.3
 
   // Trend from recent history.
   let trend: 'stable' | 'rising' | 'falling' = 'stable'
@@ -1074,13 +1054,6 @@ export function estimateSpO2(
     else if (delta < -1) trend = 'falling'
   }
 
-  return {
-    spo2: Math.round(spo2 * 10) / 10,
-    angle: Math.round(angle * 100) / 100,
-    eigenvalueRatio: Math.round(eigenvalueRatio * 1000) / 1000,
-    trend,
-    valid,
-    confidence: Math.round(confidence * 1000) / 1000,
-  }
+  return { spo2: Math.round(spo2 * 10) / 10, angle: Math.round(angle * 100) / 100, trend, valid }
 }
 

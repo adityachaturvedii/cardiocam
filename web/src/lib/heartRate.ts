@@ -155,16 +155,6 @@ export class HeartRateEstimator {
   private recentSpO2: number[] = []
   private readonly rrSnrThreshold = 2.5
 
-  // #1 EWMA on SpO2: smooths frame-to-frame jitter in the PBV angle.
-  // Half-life 5s (~150 frames at 30 FPS) — SpO2 changes slowly in reality.
-  private readonly spo2EwmaHalfLife = 150
-  private ewmaSpO2: number | null = null
-
-  // #2 Bayesian prior: population SpO2 ~ N(97, 2²). When signal
-  // confidence is low (noisy eigenvector, unstable HR/RR), blend
-  // toward this prior. When confidence is high, trust the measurement.
-  private readonly spo2PriorMean = 97
-
   private state: HeartRateState
 
   constructor(method: BvpMethod = 'POS') {
@@ -217,7 +207,6 @@ export class HeartRateEstimator {
     this.accumSpectrum = null
     this.ewmaBpm = null
     this.recentSpO2 = []
-    this.ewmaSpO2 = null
     this.state = this.makeInitialState()
   }
 
@@ -545,41 +534,10 @@ export class HeartRateEstimator {
     const rrValid = rrEst.snr >= this.rrSnrThreshold && rrEst.rr > 0
 
     // ── SpO2 (experimental) ──
-    // PBV vector angle + eigenvalue ratio → raw SpO2 estimate.
+    // Uses the red and blue channel buffers directly (not the BVP).
     const spo2Est = estimateSpO2(rArr, gArr, bArr, ts, this.recentSpO2)
-
-    // #1 EWMA: smooth the raw SpO2 to reduce eigenvector noise.
-    // Only update on valid frames; don't decay on invalid ones.
     if (spo2Est.valid && spo2Est.spo2 > 0) {
-      if (this.ewmaSpO2 === null) {
-        this.ewmaSpO2 = spo2Est.spo2
-      } else {
-        const alpha = 1 - Math.exp(-Math.LN2 / this.spo2EwmaHalfLife)
-        this.ewmaSpO2 = (1 - alpha) * this.ewmaSpO2 + alpha * spo2Est.spo2
-      }
-    }
-    const smoothedSpO2 = this.ewmaSpO2 ?? spo2Est.spo2
-
-    // #2 Bayesian prior blending. The measurement confidence (0-1) from
-    // the PBV method gates how much we trust the measurement vs the
-    // population prior (N(97, 2²)). Also factor in HR/RR stability:
-    // if both are valid and stable, we're more confident the signal is
-    // clean; if either is flapping, dampen toward the prior.
-    const hrStable = valid && this.framesSinceValid < 30
-    const rrStable = rrValid && rrEst.snr > 3
-    const stabilityBoost = (hrStable ? 0.3 : 0) + (rrStable ? 0.2 : 0)
-    const totalConfidence = Math.min(1, spo2Est.confidence + stabilityBoost)
-
-    // Blend: posterior = confidence * measurement + (1-confidence) * prior.
-    // This is the simplified Bayesian update — equivalent to a Kalman
-    // filter where the measurement noise is 1/confidence and the prior
-    // noise is fixed.
-    const blendedSpO2 = totalConfidence * smoothedSpO2
-      + (1 - totalConfidence) * this.spo2PriorMean
-    const finalSpO2 = Math.max(70, Math.min(100, blendedSpO2))
-
-    if (spo2Est.valid && finalSpO2 > 0) {
-      this.recentSpO2.push(finalSpO2)
+      this.recentSpO2.push(spo2Est.spo2)
       if (this.recentSpO2.length > 60) this.recentSpO2.shift()
     }
 
@@ -599,7 +557,7 @@ export class HeartRateEstimator {
       rr: rrEst.rr,
       rrSnr: rrEst.snr,
       rrValid,
-      spo2: Math.round(finalSpO2 * 10) / 10,
+      spo2: spo2Est.spo2,
       spo2Valid: spo2Est.valid,
       spo2Trend: spo2Est.trend,
     }
