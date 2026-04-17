@@ -772,3 +772,207 @@ function medianOf(a: Float64Array): number {
   if (n === 0) return 0
   return n % 2 === 0 ? (s[n / 2 - 1] + s[n / 2]) / 2 : s[(n - 1) / 2]
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Respiratory rate estimation
+// ──────────────────────────────────────────────────────────────────────
+
+export interface RREstimate {
+  /** Breaths per minute. 0 if SNR too low. */
+  rr: number
+  /** Peak / in-band-median ratio. */
+  snr: number
+  /** Power spectrum in the respiratory band. */
+  fft: Float64Array
+  /** Frequency axis in breaths-per-minute. */
+  freqsBpm: Float64Array
+}
+
+/**
+ * Estimate respiratory rate from a BVP signal. Breathing modulates the
+ * pulse amplitude and baseline — a bandpass in the respiratory band
+ * (0.18–0.5 Hz = 11–30 breaths/min) isolates this modulation.
+ *
+ * Same DSP approach as HR: smoothPriorDetrend → bandpass → Hamming →
+ * FFT → peak-pick, just in a lower frequency band.
+ *
+ * Needs a longer buffer (~8 s minimum, ideally 12+) because one full
+ * respiratory cycle is 2–5 s. At 8 s × 30 FPS = 240 samples we get
+ * at most ~2 full breaths in the window, which gives coarse spectral
+ * resolution. Still usable for a rough display.
+ */
+export function estimateRR(
+  bvp: Float64Array,
+  times: Float64Array,
+  nFft: number
+): RREstimate {
+  const L = bvp.length
+  if (L < 60) {
+    return { rr: 0, snr: 0, fft: new Float64Array(0), freqsBpm: new Float64Array(0) }
+  }
+  const duration = times[L - 1] - times[0]
+  const fps = duration > 0 ? (L - 1) / duration : 30
+
+  // Detrend + bandpass in the respiratory band.
+  const detrended = smoothPriorDetrend(bvp, 300)
+  const evenTimes = new Float64Array(L)
+  for (let i = 0; i < L; i++) evenTimes[i] = times[0] + (i * duration) / (L - 1)
+  const interpolated = new Float64Array(L)
+  interpolate(evenTimes, times, detrended, interpolated)
+
+  const { b, a } = designButterBandpass1(0.18, 0.5, fps)
+  const filtered = filtfilt(b, a, interpolated)
+
+  // Window + FFT.
+  const win = hammingWindow(L)
+  for (let i = 0; i < L; i++) filtered[i] *= win[i]
+  const norm = l2Norm(filtered)
+  if (norm > 0) for (let i = 0; i < L; i++) filtered[i] /= norm
+
+  const fftObj = new FFT(nFft)
+  const input = fftObj.createComplexArray()
+  const output = fftObj.createComplexArray()
+  for (let i = 0; i < input.length; i++) input[i] = 0
+  for (let i = 0; i < L; i++) input[2 * i] = filtered[i] * 30
+
+  fftObj.transform(output, input)
+
+  const halfBins = nFft / 2 + 1
+  const power = new Float64Array(halfBins)
+  for (let i = 0; i < halfBins; i++) {
+    const re = output[2 * i]
+    const im = output[2 * i + 1]
+    power[i] = re * re + im * im
+  }
+
+  // Restrict to respiratory band: 0.18–0.5 Hz → 11–30 breaths/min.
+  const rrMin = 11
+  const rrMax = 30
+  const binBpm = (60 * fps) / nFft
+  const loIdx = Math.ceil(rrMin / binBpm)
+  const hiIdx = Math.min(halfBins - 1, Math.floor(rrMax / binBpm))
+  const bandLen = Math.max(0, hiIdx - loIdx + 1)
+  const bandFft = new Float64Array(bandLen)
+  const bandFreqs = new Float64Array(bandLen)
+  for (let i = 0; i < bandLen; i++) {
+    bandFft[i] = power[loIdx + i]
+    bandFreqs[i] = (loIdx + i) * binBpm
+  }
+
+  let peakIdx = 0
+  let peakVal = 0
+  for (let i = 0; i < bandLen; i++) {
+    if (bandFft[i] > peakVal) {
+      peakVal = bandFft[i]
+      peakIdx = i
+    }
+  }
+  const rr = bandLen > 0 ? bandFreqs[peakIdx] : 0
+  const median = bandLen > 0 ? medianOf(bandFft) : 0
+  const snr = median > 0 && peakVal > 0 ? peakVal / median : 0
+  return { rr, snr, fft: bandFft, freqsBpm: bandFreqs }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// SpO2 estimation (experimental)
+// ──────────────────────────────────────────────────────────────────────
+
+export interface SpO2Estimate {
+  /** Estimated SpO2 percentage. 0 if invalid. */
+  spo2: number
+  /** The AC/DC ratio R used for the calibration curve. */
+  ratioR: number
+  /** Trend direction: 'stable' | 'rising' | 'falling'. Computed from
+   *  the slope of the last N SpO2 values the caller maintains. */
+  trend: 'stable' | 'rising' | 'falling'
+  /** True when the estimate is likely trustworthy (sufficient pulsatile
+   *  component in both channels). */
+  valid: boolean
+}
+
+/**
+ * Estimate SpO2 from per-frame R and B channel means.
+ *
+ * Traditional pulse oximetry uses red + infrared LEDs and a Beer-Lambert
+ * model. Camera-based rPPG has no IR, so we approximate using the
+ * ratio of pulsatile (AC) to mean (DC) components in the red and blue
+ * channels:
+ *
+ *   R_ratio = (AC_red / DC_red) / (AC_blue / DC_blue)
+ *   SpO2 ≈ 110 - 25 × R_ratio
+ *
+ * The linear calibration curve is the simplest approximation from the
+ * literature (Verkruysse 2008; Humphreys 2007). It's NOT validated for
+ * clinical use. Accuracy is ±3-5% SpO2 on typical webcam setups —
+ * clinically useless for hypoxemia detection.
+ *
+ * This function takes the full-buffer R and B channel arrays and computes
+ * AC (RMS of bandpass-filtered signal) and DC (mean) for each.
+ *
+ * @param recentSpO2 — array of recent SpO2 values the caller has
+ *   accumulated, used only for the trend calculation.
+ */
+export function estimateSpO2(
+  rBuf: Float64Array,
+  bBuf: Float64Array,
+  times: Float64Array,
+  recentSpO2: number[]
+): SpO2Estimate {
+  const L = rBuf.length
+  const INVALID: SpO2Estimate = { spo2: 0, ratioR: 0, trend: 'stable', valid: false }
+  if (L < 60) return INVALID
+
+  const duration = times[L - 1] - times[0]
+  const fps = duration > 0 ? (L - 1) / duration : 30
+
+  // DC = mean of each channel over the buffer.
+  let dcR = 0
+  let dcB = 0
+  for (let i = 0; i < L; i++) {
+    dcR += rBuf[i]
+    dcB += bBuf[i]
+  }
+  dcR /= L
+  dcB /= L
+  if (dcR < 1 || dcB < 1) return INVALID
+
+  // AC = RMS of bandpass-filtered signal in the cardiac band (0.75-2.5 Hz).
+  // This isolates the pulsatile component caused by blood volume changes.
+  const { b, a } = designButterBandpass1(0.75, 2.5, fps)
+  const acR = rms(filtfilt(b, a, rBuf))
+  const acB = rms(filtfilt(b, a, bBuf))
+
+  if (acB < 1e-9 || dcB < 1e-9) return INVALID
+
+  const ratioR = (acR / dcR) / (acB / dcB)
+  // Linear calibration curve.
+  let spo2 = 110 - 25 * ratioR
+
+  // Clamp to physiological range.
+  spo2 = Math.max(70, Math.min(100, spo2))
+
+  // Validity: both channels need a measurable pulsatile component.
+  // If AC/DC is too small, the signal is below noise floor.
+  const valid = (acR / dcR) > 0.0005 && (acB / dcB) > 0.0005
+
+  // Trend from recent history.
+  let trend: 'stable' | 'rising' | 'falling' = 'stable'
+  if (recentSpO2.length >= 10) {
+    const recent = recentSpO2.slice(-30)
+    const firstHalf = recent.slice(0, Math.floor(recent.length / 2))
+    const secondHalf = recent.slice(Math.floor(recent.length / 2))
+    const avg1 = firstHalf.reduce((a, b) => a + b, 0) / firstHalf.length
+    const avg2 = secondHalf.reduce((a, b) => a + b, 0) / secondHalf.length
+    const delta = avg2 - avg1
+    if (delta > 1) trend = 'rising'
+    else if (delta < -1) trend = 'falling'
+  }
+
+  return { spo2: Math.round(spo2 * 10) / 10, ratioR, trend, valid }
+}
+
+function rms(v: Float64Array): number {
+  let s = 0
+  for (let i = 0; i < v.length; i++) s += v[i] * v[i]
+  return Math.sqrt(s / v.length)
+}

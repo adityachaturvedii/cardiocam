@@ -1,10 +1,14 @@
 import {
   chromTransform,
   estimateBpm,
+  estimateRR,
+  estimateSpO2,
   omitTransform,
   pickPeak,
   posTransform,
 } from './signalProcessing'
+// SpO2Estimate and RREstimate types are inferred from the function return
+// types — no explicit import needed.
 import type { CheekSample } from './roi'
 
 export type BvpMethod =
@@ -44,6 +48,22 @@ export interface HeartRateState {
   framesSinceValid: number
   /** Which BVP extractor is active for this session. */
   method: BvpMethod
+
+  // ── Respiratory rate ──
+  /** Breaths per minute. 0 while acquiring. */
+  rr: number
+  /** SNR of the respiratory peak. */
+  rrSnr: number
+  /** True when the RR reading should be trusted. */
+  rrValid: boolean
+
+  // ── SpO2 (experimental) ──
+  /** Estimated SpO2 percentage. 0 while acquiring. */
+  spo2: number
+  /** True when SpO2 has enough pulsatile signal. */
+  spo2Valid: boolean
+  /** 'stable' | 'rising' | 'falling' over the last ~30 readings. */
+  spo2Trend: 'stable' | 'rising' | 'falling'
 }
 
 export class HeartRateEstimator {
@@ -130,6 +150,11 @@ export class HeartRateEstimator {
   private framesBelowExit = 0
   private framesSinceValid = Infinity
 
+  // SpO2 trend history — rolling window of recent SpO2 values for
+  // trend detection (rising / falling / stable).
+  private recentSpO2: number[] = []
+  private readonly rrSnrThreshold = 2.5
+
   private state: HeartRateState
 
   constructor(method: BvpMethod = 'POS') {
@@ -181,6 +206,7 @@ export class HeartRateEstimator {
     this.framesSinceValid = Infinity
     this.accumSpectrum = null
     this.ewmaBpm = null
+    this.recentSpO2 = []
     this.state = this.makeInitialState()
   }
 
@@ -500,6 +526,21 @@ export class HeartRateEstimator {
     const stableReadable =
       stable > 0 && this.framesSinceValid <= this.staleReadableFrames
 
+    // ── Respiratory rate ──
+    // Same BVP signal, different bandpass band. RR is noisier than HR
+    // because the signal is weaker and the spectral resolution at
+    // ~0.3 Hz is coarse in an 8s window.
+    const rrEst = estimateRR(bvp, ts, this.nFft)
+    const rrValid = rrEst.snr >= this.rrSnrThreshold && rrEst.rr > 0
+
+    // ── SpO2 (experimental) ──
+    // Uses the red and blue channel buffers directly (not the BVP).
+    const spo2Est = estimateSpO2(rArr, bArr, ts, this.recentSpO2)
+    if (spo2Est.valid && spo2Est.spo2 > 0) {
+      this.recentSpO2.push(spo2Est.spo2)
+      if (this.recentSpO2.length > 60) this.recentSpO2.shift()
+    }
+
     this.state = {
       bpm: est.bpm,
       snr: est.snr,
@@ -513,6 +554,12 @@ export class HeartRateEstimator {
       stableReadable,
       framesSinceValid: this.framesSinceValid,
       method: this.method,
+      rr: rrEst.rr,
+      rrSnr: rrEst.snr,
+      rrValid,
+      spo2: spo2Est.spo2,
+      spo2Valid: spo2Est.valid,
+      spo2Trend: spo2Est.trend,
     }
     return this.state
   }
@@ -541,6 +588,12 @@ export class HeartRateEstimator {
       stableReadable: false,
       framesSinceValid: Infinity,
       method: this.method,
+      rr: 0,
+      rrSnr: 0,
+      rrValid: false,
+      spo2: 0,
+      spo2Valid: false,
+      spo2Trend: 'stable',
     }
   }
 }

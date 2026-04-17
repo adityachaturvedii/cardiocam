@@ -32,6 +32,12 @@ const INITIAL_HR_STATE: HeartRateState = {
   stableReadable: false,
   framesSinceValid: Infinity,
   method: 'POS',
+  rr: 0,
+  rrSnr: 0,
+  rrValid: false,
+  spo2: 0,
+  spo2Valid: false,
+  spo2Trend: 'stable',
 }
 
 export default function Reader() {
@@ -319,24 +325,67 @@ export default function Reader() {
 
           {/* Metrics + plots column */}
           <aside className="flex flex-col gap-6">
-            {/* BPM card */}
-            <div className="rounded-2xl bg-white shadow-sm border border-ink/5 p-6 md:p-8 text-center">
-              <div
-                className={`inline-flex items-baseline gap-3 ${hr.valid ? 'text-heart' : holding ? 'text-heart/60' : 'text-ink2/40'}`}
-              >
-                <HeartIcon
-                  bpm={canShowNumber ? displayBpm : 0}
-                  size={32}
-                  className="self-center"
-                />
-                <div className="text-7xl md:text-8xl font-semibold tabular-nums leading-none">
-                  {bpmText}
+            {/* Vitals card — BPM, RR, SpO2 */}
+            <div className="rounded-2xl bg-white shadow-sm border border-ink/5 p-5 md:p-6">
+              {/* BPM — primary vital */}
+              <div className="text-center">
+                <div
+                  className={`inline-flex items-baseline gap-3 ${hr.valid ? 'text-heart' : holding ? 'text-heart/60' : 'text-ink2/40'}`}
+                >
+                  <HeartIcon
+                    bpm={canShowNumber ? displayBpm : 0}
+                    size={28}
+                    className="self-center"
+                  />
+                  <div className="text-6xl md:text-7xl font-semibold tabular-nums leading-none">
+                    {bpmText}
+                  </div>
+                </div>
+                <div className="mt-1 text-xs text-ink2 uppercase tracking-wider">
+                  heart rate · bpm
                 </div>
               </div>
-              <div className="mt-2 text-sm text-ink2 uppercase tracking-wider">
-                beats per minute
+
+              {/* RR + SpO2 — secondary vitals, side by side */}
+              <div className="mt-4 grid grid-cols-2 gap-4 border-t border-ink/5 pt-4">
+                {/* Respiratory rate */}
+                <div className="text-center">
+                  <div
+                    className={`text-3xl md:text-4xl font-semibold tabular-nums ${hr.rrValid ? 'text-pulse' : 'text-ink2/40'}`}
+                  >
+                    {hr.rrValid ? Math.round(hr.rr) : '--'}
+                  </div>
+                  <div className="mt-1 text-[10px] text-ink2 uppercase tracking-wider leading-tight">
+                    resp. rate · brpm
+                  </div>
+                </div>
+
+                {/* SpO2 */}
+                <div className="text-center">
+                  <div
+                    className={`text-3xl md:text-4xl font-semibold tabular-nums ${hr.spo2Valid ? 'text-blue-500' : 'text-ink2/40'}`}
+                  >
+                    {hr.spo2Valid ? hr.spo2.toFixed(0) : '--'}
+                    {hr.spo2Valid && (
+                      <span className="text-lg font-normal">%</span>
+                    )}
+                  </div>
+                  <div className="mt-1 text-[10px] text-ink2 uppercase tracking-wider leading-tight">
+                    SpO₂{' '}
+                    {hr.spo2Valid && hr.spo2Trend !== 'stable' && (
+                      <span className={hr.spo2Trend === 'rising' ? 'text-green-500' : 'text-amber-500'}>
+                        {hr.spo2Trend === 'rising' ? '↑' : '↓'}
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-[9px] text-ink2/50 mt-0.5">
+                    experimental
+                  </div>
+                </div>
               </div>
-              <div className="mt-4 text-xs text-ink2 tabular-nums min-h-[1em]">
+
+              {/* Status line */}
+              <div className="mt-3 text-xs text-ink2 tabular-nums text-center min-h-[1em]">
                 {statusLine}
               </div>
             </div>
